@@ -91,6 +91,7 @@ namespace SnowFlyer2
         private static bool ShouldLoopTime = false;
         private static bool IsTimePassing = true;
         private static bool IsTrackingPlayerCoords = false;
+        private static bool IsTrackingCameraCoords = false;
         private static bool HasCameraScanBaseline = false;
         private static Dictionary<IntPtr, Vector3> CameraScanBaseline;
         private static Vector3 CameraScanCenter;
@@ -159,6 +160,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.FindCameraPointers, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ResetCameraScan, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ProbeCameraChain, KeyModifiers.Control);
+            HotKeyManager.RegisterHotKey(config.ToggleCameraTracking, KeyModifiers.Control);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -431,18 +433,16 @@ namespace SnowFlyer2
             try
             {
                 IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
-                if (!TryReadPointer(processHandle,
-                    new IntPtr(moduleBase.ToInt64() + KnownCameraModuleOffset),
-                    out long stableSlot) ||
-                    !TryReadPointer(processHandle, new IntPtr(stableSlot), out long vectorBase) ||
-                    !TryReadVector3(processHandle,
-                        new IntPtr(vectorBase + KnownCameraVectorOffset),
-                        out Vector3 value))
+                if (!TryReadKnownCameraVector(processHandle, moduleBase, out Vector3 value))
                 {
                     Console.WriteLine("Known camera chain did not resolve.");
                     return;
                 }
 
+                TryReadPointer(processHandle,
+                    new IntPtr(moduleBase.ToInt64() + KnownCameraModuleOffset),
+                    out long stableSlot);
+                TryReadPointer(processHandle, new IntPtr(stableSlot), out long vectorBase);
                 Console.WriteLine($"Known camera chain: SnowRunner.exe+0x{KnownCameraModuleOffset:X} -> " +
                     $"0x{stableSlot:X} -> 0x{vectorBase + KnownCameraVectorOffset:X} = " +
                     $"{value.X:F2},{value.Y:F2},{value.Z:F2}");
@@ -451,6 +451,73 @@ namespace SnowFlyer2
             {
                 CloseHandle(processHandle);
             }
+        }
+
+        private static void ToggleCameraCoordTracking(Process snowRunnerProcess)
+        {
+            if (IsTrackingCameraCoords)
+            {
+                IsTrackingCameraCoords = false;
+                Console.WriteLine("Camera coordinate tracking stopped.");
+                return;
+            }
+
+            IsTrackingCameraCoords = true;
+            Task.Run(() => TrackCameraCoords(snowRunnerProcess));
+            Console.WriteLine("Camera coordinate tracking started.");
+        }
+
+        private static void TrackCameraCoords(Process snowRunnerProcess)
+        {
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+            {
+                IsTrackingCameraCoords = false;
+                Console.WriteLine("Could not open SnowRunner for camera tracking.");
+                return;
+            }
+
+            try
+            {
+                IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
+                while (IsTrackingCameraCoords)
+                {
+                    if (!TryReadKnownCameraVector(processHandle, moduleBase, out Vector3 value))
+                    {
+                        Console.WriteLine("Camera coordinate chain no longer resolves.");
+                        IsTrackingCameraCoords = false;
+                        break;
+                    }
+
+                    Console.WriteLine($"CAMERA: {value.X:F2} {value.Y:F2} {value.Z:F2}");
+                    Thread.Sleep(250);
+                }
+            }
+            catch (Exception ex)
+            {
+                IsTrackingCameraCoords = false;
+                Console.WriteLine($"Camera coordinate tracking failed: {ex.Message}");
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
+        }
+
+        private static bool TryReadKnownCameraVector(IntPtr processHandle, IntPtr moduleBase, out Vector3 value)
+        {
+            value = default;
+            if (!TryReadPointer(processHandle,
+                new IntPtr(moduleBase.ToInt64() + KnownCameraModuleOffset),
+                out long stableSlot) ||
+                !TryReadPointer(processHandle, new IntPtr(stableSlot), out long vectorBase))
+            {
+                return false;
+            }
+
+            return TryReadVector3(processHandle,
+                new IntPtr(vectorBase + KnownCameraVectorOffset),
+                out value);
         }
 
         private static bool TryReadPlayerCoords(Process snowRunnerProcess, out Vector3 playerVector)
@@ -1221,6 +1288,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.FindCameraPointers +": \t Find module references to camera candidates\n");
             Console.WriteLine("Ctrl + "+ config.ResetCameraScan +": \t Reset camera scan candidates\n");
             Console.WriteLine("Ctrl + "+ config.ProbeCameraChain +": \t Probe the fast camera pointer chain\n");
+            Console.WriteLine("Ctrl + "+ config.ToggleCameraTracking +": \t Toggle continuous camera tracking\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -1301,6 +1369,10 @@ namespace SnowFlyer2
             else if (e2.Key == config.ProbeCameraChain)
             {
                 ProbeKnownCameraChain(snowRunnerProcess);
+            }
+            else if (e2.Key == config.ToggleCameraTracking)
+            {
+                ToggleCameraCoordTracking(snowRunnerProcess);
             }
             else
             {
