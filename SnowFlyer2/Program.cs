@@ -100,7 +100,8 @@ namespace SnowFlyer2
         private const uint MemoryCommit = 0x1000;
         private const uint PageGuard = 0x100;
         private const uint PageNoAccess = 0x01;
-        private const int CameraScanRadius = 250;
+        private const int CameraScanRadius = 300;
+        private const int CameraScanVerticalRadius = 100;
         private const int CameraScanChunkSize = 1024 * 1024;
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -340,10 +341,20 @@ namespace SnowFlyer2
                 }
 
                 Console.WriteLine($"Changed camera candidates: {changedCandidates.Count}");
-                int resultCount = Math.Min(changedCandidates.Count, 20);
-                for (int i = 0; i < resultCount; i++)
+                var smallChanges = changedCandidates
+                    .Where(candidate => candidate.Distance <= 25.0f)
+                    .OrderBy(candidate => candidate.Distance)
+                    .Take(20)
+                    .ToList();
+                var results = smallChanges.Count > 0
+                    ? smallChanges
+                    : changedCandidates.Take(20).ToList();
+
+                if (smallChanges.Count > 0)
+                    Console.WriteLine("Small movement candidates:");
+
+                foreach (var candidate in results)
                 {
-                    var candidate = changedCandidates[i];
                     Console.WriteLine($"0x{candidate.Address.ToInt64():X}: " +
                         $"{candidate.Before.X:F2},{candidate.Before.Y:F2},{candidate.Before.Z:F2} -> " +
                         $"{candidate.After.X:F2},{candidate.After.Y:F2},{candidate.After.Z:F2} " +
@@ -438,7 +449,7 @@ namespace SnowFlyer2
                         BitConverter.ToSingle(buffer, index),
                         BitConverter.ToSingle(buffer, index + 4),
                         BitConverter.ToSingle(buffer, index + 8));
-                    if (IsFiniteVector(value) && Vector3.DistanceSquared(value, center) <= radiusSquared)
+                    if (IsFiniteVector(value) && IsNearCameraSearchArea(value, center, radius, radiusSquared))
                     {
                         candidates[new IntPtr(regionBase + offset + index)] = value;
                     }
@@ -465,7 +476,7 @@ namespace SnowFlyer2
                         BitConverter.ToSingle(buffer, 0),
                         BitConverter.ToSingle(buffer, 4),
                         BitConverter.ToSingle(buffer, 8));
-                    if (!IsFiniteVector(current) || Vector3.DistanceSquared(current, CameraScanCenter) > CameraScanRadius * CameraScanRadius)
+                    if (!IsFiniteVector(current) || !IsNearCameraSearchArea(current, CameraScanCenter, CameraScanRadius, CameraScanRadius * CameraScanRadius))
                         continue;
 
                     float distance = Vector3.Distance(entry.Value, current);
@@ -502,6 +513,14 @@ namespace SnowFlyer2
             return !float.IsNaN(value.X) && !float.IsInfinity(value.X) &&
                    !float.IsNaN(value.Y) && !float.IsInfinity(value.Y) &&
                    !float.IsNaN(value.Z) && !float.IsInfinity(value.Z);
+        }
+
+        private static bool IsNearCameraSearchArea(Vector3 value, Vector3 center, float radius, float radiusSquared)
+        {
+            return Math.Abs(value.X - center.X) <= radius &&
+                   Math.Abs(value.Z - center.Z) <= radius &&
+                   Math.Abs(value.Y - center.Y) <= CameraScanVerticalRadius &&
+                   Vector3.DistanceSquared(value, center) <= radiusSquared;
         }
 
         public static IntPtr ReadOffsetFromOpcode(IMemory memory, IntPtr opcodeBegin, int offsetUntilAddress)
