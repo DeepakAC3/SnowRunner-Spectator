@@ -108,6 +108,8 @@ namespace SnowFlyer2
         private const int CameraScanChunkSize = 1024 * 1024;
         private const int PointerSearchRange = 0x400;
         private const int CameraCandidateRetentionCount = 100;
+        private const long KnownCameraModuleOffset = 0x2A99E80;
+        private const int KnownCameraVectorOffset = 0x1B8;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
@@ -156,6 +158,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.CaptureCameraScan, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.FindCameraPointers, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ResetCameraScan, KeyModifiers.Control);
+            HotKeyManager.RegisterHotKey(config.ProbeCameraChain, KeyModifiers.Control);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -414,6 +417,40 @@ namespace SnowFlyer2
             LastPointerReferenceAddresses.Clear();
             ActiveCameraPointerChain = null;
             Console.WriteLine("Camera scan reset. Press Ctrl+F6 for a new initial scan.");
+        }
+
+        private static void ProbeKnownCameraChain(Process snowRunnerProcess)
+        {
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+            {
+                Console.WriteLine("Could not open SnowRunner for the camera chain probe.");
+                return;
+            }
+
+            try
+            {
+                IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
+                if (!TryReadPointer(processHandle,
+                    new IntPtr(moduleBase.ToInt64() + KnownCameraModuleOffset),
+                    out long stableSlot) ||
+                    !TryReadPointer(processHandle, new IntPtr(stableSlot), out long vectorBase) ||
+                    !TryReadVector3(processHandle,
+                        new IntPtr(vectorBase + KnownCameraVectorOffset),
+                        out Vector3 value))
+                {
+                    Console.WriteLine("Known camera chain did not resolve.");
+                    return;
+                }
+
+                Console.WriteLine($"Known camera chain: SnowRunner.exe+0x{KnownCameraModuleOffset:X} -> " +
+                    $"0x{stableSlot:X} -> 0x{vectorBase + KnownCameraVectorOffset:X} = " +
+                    $"{value.X:F2},{value.Y:F2},{value.Z:F2}");
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
         }
 
         private static bool TryReadPlayerCoords(Process snowRunnerProcess, out Vector3 playerVector)
@@ -1183,6 +1220,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.CaptureCameraScan +": \t Capture/compare freecam vectors\n");
             Console.WriteLine("Ctrl + "+ config.FindCameraPointers +": \t Find module references to camera candidates\n");
             Console.WriteLine("Ctrl + "+ config.ResetCameraScan +": \t Reset camera scan candidates\n");
+            Console.WriteLine("Ctrl + "+ config.ProbeCameraChain +": \t Probe the fast camera pointer chain\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -1259,6 +1297,10 @@ namespace SnowFlyer2
             else if (e2.Key == config.ResetCameraScan)
             {
                 ResetCameraScan();
+            }
+            else if (e2.Key == config.ProbeCameraChain)
+            {
+                ProbeKnownCameraChain(snowRunnerProcess);
             }
             else
             {

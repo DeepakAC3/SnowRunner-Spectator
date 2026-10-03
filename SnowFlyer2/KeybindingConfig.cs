@@ -36,5 +36,8 @@ namespace SnowFlyer2
 
         [JsonConverter(typeof(HexConverter))]
         public Keys ResetCameraScan { get; set; }
+
+        [JsonConverter(typeof(HexConverter))]
+        public Keys ProbeCameraChain { get; set; }
     }
 }

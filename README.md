@@ -24,6 +24,7 @@ This branch adds a first reverse-engineering aid for the spectator project:
 - `Ctrl+F7` searches pointer references after the candidate set is narrow.
 - `Ctrl+F8` resets the camera scan when a movement sequence selects unrelated
   vectors.
+- `Ctrl+F9` probes the currently known fast camera pointer chain.
 
 Use the tracker in single-player first. It should print lines in this form while
 you drive:
