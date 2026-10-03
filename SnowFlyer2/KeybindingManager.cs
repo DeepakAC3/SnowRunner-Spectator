@@ -45,12 +45,15 @@ namespace SnowFlyer2
                 if (config.ProbeCameraTransform == Keys.None)
                     config.ProbeCameraTransform = Keys.F11;
 
+                if (config.ToggleCameraFollow == Keys.None)
+                    config.ToggleCameraFollow = Keys.F12;
+
                 return config;
             }
             else
             {
                 // Default keybinding if the file doesn't exist
-                KeybindingConfig defaultBinds = new KeybindingConfig { Instructions= "The keybinds are hex key modifiers - see microsoft docs for a full list. https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes", ToggleFlyMode = Keys.F1, ToggleFreezeTime=Keys.F2, ToggleTimeLapseMode=Keys.F3, GetPlayerLocation=Keys.F4, TogglePlayerTracking=Keys.F5, CaptureCameraScan=Keys.F6, FindCameraPointers=Keys.F7, ResetCameraScan=Keys.F8, ProbeCameraChain=Keys.F9, ToggleCameraTracking=Keys.F10, ProbeCameraTransform=Keys.F11};
+                KeybindingConfig defaultBinds = new KeybindingConfig { Instructions= "The keybinds are hex key modifiers - see microsoft docs for a full list. https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes", ToggleFlyMode = Keys.F1, ToggleFreezeTime=Keys.F2, ToggleTimeLapseMode=Keys.F3, GetPlayerLocation=Keys.F4, TogglePlayerTracking=Keys.F5, CaptureCameraScan=Keys.F6, FindCameraPointers=Keys.F7, ResetCameraScan=Keys.F8, ProbeCameraChain=Keys.F9, ToggleCameraTracking=Keys.F10, ProbeCameraTransform=Keys.F11, ToggleCameraFollow=Keys.F12};
                 SaveKeybindingConfig(defaultBinds);
                 return defaultBinds;
             }

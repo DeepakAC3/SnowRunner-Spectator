@@ -92,6 +92,8 @@ namespace SnowFlyer2
         private static bool IsTimePassing = true;
         private static bool IsTrackingPlayerCoords = false;
         private static bool IsTrackingCameraCoords = false;
+        private static bool IsFollowingPlayer = false;
+        private static Vector3 CameraFollowOffset;
         private static bool HasCameraScanBaseline = false;
         private static Dictionary<IntPtr, Vector3> CameraScanBaseline;
         private static Vector3 CameraScanCenter;
@@ -101,6 +103,8 @@ namespace SnowFlyer2
 
         private const uint ProcessQueryInformation = 0x0400;
         private const uint ProcessVmRead = 0x0010;
+        private const uint ProcessVmWrite = 0x0020;
+        private const uint ProcessVmOperation = 0x0008;
         private const uint MemoryCommit = 0x1000;
         private const uint PageGuard = 0x100;
         private const uint PageNoAccess = 0x01;
@@ -123,6 +127,9 @@ namespace SnowFlyer2
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool ReadProcessMemory(IntPtr processHandle, IntPtr baseAddress, byte[] buffer, int size, out IntPtr bytesRead);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool WriteProcessMemory(IntPtr processHandle, IntPtr baseAddress, byte[] buffer, int size, out IntPtr bytesWritten);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
@@ -165,6 +172,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.ProbeCameraChain, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleCameraTracking, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ProbeCameraTransform, KeyModifiers.Control);
+            HotKeyManager.RegisterHotKey(config.ToggleCameraFollow, KeyModifiers.Control);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -471,6 +479,88 @@ namespace SnowFlyer2
             Console.WriteLine("Camera coordinate tracking started.");
         }
 
+        private static void ToggleCameraFollow(Process snowRunnerProcess)
+        {
+            if (IsFollowingPlayer)
+            {
+                IsFollowingPlayer = false;
+                Console.WriteLine("Camera follow stopped.");
+                return;
+            }
+
+            if (!TryReadKnownCameraVector(snowRunnerProcess, out Vector3 cameraPosition) ||
+                !TryReadPlayerCoords(snowRunnerProcess, out Vector3 playerPosition))
+            {
+                Console.WriteLine("Could not read the camera and player positions for follow mode.");
+                return;
+            }
+
+            CameraFollowOffset = cameraPosition - playerPosition;
+            IsFollowingPlayer = true;
+            Task.Run(() => TrackCameraFollow(snowRunnerProcess));
+            Console.WriteLine($"Camera follow started with offset {CameraFollowOffset.X:F2} " +
+                $"{CameraFollowOffset.Y:F2} {CameraFollowOffset.Z:F2}.");
+        }
+
+        private static void TrackCameraFollow(Process snowRunnerProcess)
+        {
+            IntPtr processHandle = OpenProcess(
+                ProcessQueryInformation | ProcessVmRead | ProcessVmWrite | ProcessVmOperation,
+                false,
+                snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+            {
+                IsFollowingPlayer = false;
+                Console.WriteLine("Could not open SnowRunner for camera follow mode.");
+                return;
+            }
+
+            try
+            {
+                if (!TryCreatePlayerCoordinateReader(snowRunnerProcess, out StructPointerDescription<Vector3> playerCoord))
+                {
+                    IsFollowingPlayer = false;
+                    Console.WriteLine("Player coordinate pointer could not be resolved for follow mode.");
+                    return;
+                }
+
+                IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
+                while (IsFollowingPlayer)
+                {
+                    Vector3 playerPosition = playerCoord.Read();
+                    if (!IsFiniteVector(playerPosition) ||
+                        !TryReadKnownCameraBase(processHandle, moduleBase, out long cameraBase))
+                    {
+                        IsFollowingPlayer = false;
+                        Console.WriteLine("Camera follow could not resolve the current game state.");
+                        break;
+                    }
+
+                    Vector3 targetPosition = playerPosition + CameraFollowOffset;
+                    if (!TryWriteVector3(processHandle,
+                        new IntPtr(cameraBase + KnownCameraVectorOffset),
+                        targetPosition))
+                    {
+                        IsFollowingPlayer = false;
+                        Console.WriteLine("Camera follow could not write the camera position.");
+                        break;
+                    }
+
+                    Console.WriteLine($"FOLLOW: {targetPosition.X:F2} {targetPosition.Y:F2} {targetPosition.Z:F2}");
+                    Thread.Sleep(100);
+                }
+            }
+            catch (Exception ex)
+            {
+                IsFollowingPlayer = false;
+                Console.WriteLine($"Camera follow failed: {ex.Message}");
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
+        }
+
         private static void ProbeCameraTransform(Process snowRunnerProcess)
         {
             IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
@@ -566,6 +656,26 @@ namespace SnowFlyer2
                 out value);
         }
 
+        private static bool TryReadKnownCameraVector(Process snowRunnerProcess, out Vector3 value)
+        {
+            value = default;
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+                return false;
+
+            try
+            {
+                return TryReadKnownCameraVector(
+                    processHandle,
+                    snowRunnerProcess.MainModule.BaseAddress,
+                    out value);
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
+        }
+
         private static bool TryReadKnownCameraBase(IntPtr processHandle, IntPtr moduleBase, out long vectorBase)
         {
             vectorBase = 0;
@@ -602,6 +712,32 @@ namespace SnowFlyer2
                    Math.Abs(Vector3.Dot(rotationA, rotationB)) < 0.25f &&
                    Math.Abs(Vector3.Dot(rotationA, rotationC)) < 0.25f &&
                    Math.Abs(Vector3.Dot(rotationB, rotationC)) < 0.25f;
+        }
+
+        private static bool TryCreatePlayerCoordinateReader(
+            Process snowRunnerProcess,
+            out StructPointerDescription<Vector3> playerCoord)
+        {
+            playerCoord = null;
+            var scanner = new Scanner(snowRunnerProcess, snowRunnerProcess.MainModule);
+            var coordsPtr = scanner.CompiledFindPattern(PatternPlayerCoords);
+            if (!coordsPtr.Found)
+                return false;
+
+            var memory = new ExternalMemory(snowRunnerProcess);
+            var playerCoordsBasePtr = ReadOffsetFromCallToLeaSingleton(
+                memory,
+                snowRunnerProcess.MainModule.BaseAddress + coordsPtr.Offset + GetOpcodeLengthOfPattern(PatternPlayerCoords));
+            if (playerCoordsBasePtr == IntPtr.Zero)
+                return false;
+
+            playerCoord = new StructPointerDescription<Vector3>(
+                memory,
+                playerCoordsBasePtr,
+                0x28,
+                0x18,
+                0x1A8);
+            return true;
         }
 
         private static bool TryReadPlayerCoords(Process snowRunnerProcess, out Vector3 playerVector)
@@ -959,6 +1095,16 @@ namespace SnowFlyer2
                 BitConverter.ToSingle(buffer, 4),
                 BitConverter.ToSingle(buffer, 8));
             return IsFiniteVector(value);
+        }
+
+        private static bool TryWriteVector3(IntPtr processHandle, IntPtr address, Vector3 value)
+        {
+            byte[] buffer = new byte[12];
+            Buffer.BlockCopy(BitConverter.GetBytes(value.X), 0, buffer, 0, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(value.Y), 0, buffer, 4, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(value.Z), 0, buffer, 8, 4);
+            return WriteProcessMemory(processHandle, address, buffer, buffer.Length, out IntPtr bytesWritten) &&
+                bytesWritten.ToInt32() == buffer.Length;
         }
 
         private static Dictionary<long, List<PointerTarget>> BuildPointerTargets(IEnumerable<IntPtr> addresses)
@@ -1374,6 +1520,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.ProbeCameraChain +": \t Probe the fast camera pointer chain\n");
             Console.WriteLine("Ctrl + "+ config.ToggleCameraTracking +": \t Toggle continuous camera tracking\n");
             Console.WriteLine("Ctrl + "+ config.ProbeCameraTransform +": \t Dump nearby camera transform vectors\n");
+            Console.WriteLine("Ctrl + "+ config.ToggleCameraFollow +": \t Toggle camera follow mode\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -1462,6 +1609,10 @@ namespace SnowFlyer2
             else if (e2.Key == config.ProbeCameraTransform)
             {
                 ProbeCameraTransform(snowRunnerProcess);
+            }
+            else if (e2.Key == config.ToggleCameraFollow)
+            {
+                ToggleCameraFollow(snowRunnerProcess);
             }
             else
             {
