@@ -93,6 +93,7 @@ namespace SnowFlyer2
         private static bool IsTrackingPlayerCoords = false;
         private static bool HasCameraScanBaseline = false;
         private static Dictionary<IntPtr, Vector3> CameraScanBaseline;
+        private static Vector3 CameraScanCenter;
 
         private const uint ProcessQueryInformation = 0x0400;
         private const uint ProcessVmRead = 0x0010;
@@ -322,6 +323,7 @@ namespace SnowFlyer2
                 {
                     Console.WriteLine($"Scanning for camera vectors near {playerPosition.X:F2} {playerPosition.Y:F2} {playerPosition.Z:F2}...");
                     CameraScanBaseline = ScanForVectorsNear(snowRunnerProcess, playerPosition, CameraScanRadius);
+                    CameraScanCenter = playerPosition;
                     HasCameraScanBaseline = true;
                     Console.WriteLine($"Captured {CameraScanBaseline.Count} candidate vectors. Move the free camera, then press Ctrl+F6 again.");
                     return;
@@ -463,7 +465,7 @@ namespace SnowFlyer2
                         BitConverter.ToSingle(buffer, 0),
                         BitConverter.ToSingle(buffer, 4),
                         BitConverter.ToSingle(buffer, 8));
-                    if (!IsFiniteVector(current))
+                    if (!IsFiniteVector(current) || Vector3.DistanceSquared(current, CameraScanCenter) > CameraScanRadius * CameraScanRadius)
                         continue;
 
                     float distance = Vector3.Distance(entry.Value, current);
