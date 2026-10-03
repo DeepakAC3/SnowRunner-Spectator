@@ -1013,9 +1013,21 @@ namespace SnowFlyer2
 
             try
             {
-                var targets = BuildPointerTargets(LastCameraCandidateAddresses);
+                var candidateAddresses = LastCameraCandidateAddresses.ToList();
+                IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
+                if (TryReadKnownCameraBase(processHandle, moduleBase, out long knownCameraBase))
+                {
+                    IntPtr knownCameraVector = new IntPtr(knownCameraBase + KnownCameraVectorOffset);
+                    if (!candidateAddresses.Contains(knownCameraVector))
+                    {
+                        candidateAddresses.Add(knownCameraVector);
+                        Console.WriteLine($"Including the known camera vector 0x{knownCameraVector.ToInt64():X} in pointer search.");
+                    }
+                }
 
-                long moduleStart = snowRunnerProcess.MainModule.BaseAddress.ToInt64();
+                var targets = BuildPointerTargets(candidateAddresses);
+
+                long moduleStart = moduleBase.ToInt64();
                 long moduleEnd = moduleStart + snowRunnerProcess.MainModule.ModuleMemorySize;
                 var references = ScanModuleForPointerReferences(processHandle, moduleStart, moduleEnd, targets);
 
