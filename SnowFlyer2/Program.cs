@@ -540,21 +540,7 @@ namespace SnowFlyer2
 
             try
             {
-                var targets = new Dictionary<long, List<PointerTarget>>();
-                foreach (IntPtr candidate in LastCameraCandidateAddresses)
-                {
-                    long candidateAddress = candidate.ToInt64();
-                    for (int delta = 0; delta <= PointerSearchRange; delta += 4)
-                    {
-                        long objectAddress = candidateAddress - delta;
-                        if (!targets.TryGetValue(objectAddress, out List<PointerTarget> matches))
-                        {
-                            matches = new List<PointerTarget>();
-                            targets.Add(objectAddress, matches);
-                        }
-                        matches.Add(new PointerTarget { Candidate = candidate, Delta = delta });
-                    }
-                }
+                var targets = BuildPointerTargets(LastCameraCandidateAddresses);
 
                 long moduleStart = snowRunnerProcess.MainModule.BaseAddress.ToInt64();
                 long moduleEnd = moduleStart + snowRunnerProcess.MainModule.ModuleMemorySize;
@@ -577,6 +563,21 @@ namespace SnowFlyer2
                     Console.WriteLine($"Stable reference addresses across scans: {stableReferences.Count}");
                     foreach (IntPtr stableAddress in stableReferences.Take(50))
                         Console.WriteLine($"Stable: 0x{stableAddress.ToInt64():X}");
+
+                    var secondLevelTargets = BuildPointerTargets(stableReferences);
+                    var secondLevelReferences = ScanModuleForPointerReferences(
+                        processHandle, moduleStart, moduleEnd, secondLevelTargets);
+                    if (secondLevelReferences.Count == 0)
+                        secondLevelReferences = ScanAllMemoryForPointerReferences(processHandle, secondLevelTargets);
+
+                    Console.WriteLine($"Second-level references to stable heap slots: {secondLevelReferences.Count}");
+                    foreach (var reference in secondLevelReferences.Take(40))
+                    {
+                        string location = reference.ReferenceOffset >= 0
+                            ? $"SnowRunner.exe+0x{reference.ReferenceOffset:X}"
+                            : $"0x{reference.ReferenceAddress.ToInt64():X}";
+                        Console.WriteLine($"{location} -> stable slot 0x{reference.Candidate.ToInt64():X} + 0x{reference.Delta:X}");
+                    }
                 }
 
                 foreach (var reference in references.Take(50))
@@ -601,6 +602,26 @@ namespace SnowFlyer2
             public IntPtr ReferenceAddress;
             public IntPtr Candidate;
             public int Delta;
+        }
+
+        private static Dictionary<long, List<PointerTarget>> BuildPointerTargets(IEnumerable<IntPtr> addresses)
+        {
+            var targets = new Dictionary<long, List<PointerTarget>>();
+            foreach (IntPtr address in addresses.Distinct())
+            {
+                long addressValue = address.ToInt64();
+                for (int delta = 0; delta <= PointerSearchRange; delta += 4)
+                {
+                    long objectAddress = addressValue - delta;
+                    if (!targets.TryGetValue(objectAddress, out List<PointerTarget> matches))
+                    {
+                        matches = new List<PointerTarget>();
+                        targets.Add(objectAddress, matches);
+                    }
+                    matches.Add(new PointerTarget { Candidate = address, Delta = delta });
+                }
+            }
+            return targets;
         }
 
         private static List<PointerReference> ScanModuleForPointerReferences(
