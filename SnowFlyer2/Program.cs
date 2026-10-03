@@ -1003,8 +1003,7 @@ namespace SnowFlyer2
         {
             if (LastCameraCandidateAddresses.Count == 0)
             {
-                Console.WriteLine("No camera candidates are available. Run the two-step Ctrl+F6 scan first.");
-                return;
+                Console.WriteLine("No filtered scan candidates are available; searching the known camera vector directly.");
             }
 
             IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
