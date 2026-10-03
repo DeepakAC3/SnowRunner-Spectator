@@ -1,7 +1,7 @@
 """Send one timed keyboard hold to a visible SnowRunner window.
 
-This uses the same targeted PostMessage approach as key-macro.py, but performs
-only the single action requested on the command line.
+The selected window is foregrounded and receives real Win32 SendInput events,
+which works with games that ignore ordinary window-posted key messages.
 """
 
 import argparse
@@ -11,9 +11,10 @@ import time
 from ctypes import wintypes
 
 
-WM_KEYDOWN = 0x0100
-WM_KEYUP = 0x0101
 MAPVK_VK_TO_VSC = 0
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+SW_RESTORE = 9
 
 user32 = ctypes.windll.user32
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
@@ -26,6 +27,37 @@ user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
 user32.MapVirtualKeyW.restype = wintypes.UINT
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.PostMessageW.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("data",)
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("data", INPUTUNION),
+    ]
+
+
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
 
 KEYS = {
     "a": 0x41,
@@ -89,13 +121,14 @@ def find_window(title_fragment):
     return matches[0]
 
 
-def post_key(hwnd, vk, down):
-    message = WM_KEYDOWN if down else WM_KEYUP
+def send_input_key(vk, down):
     scan_code = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
-    lparam = 1 | (scan_code << 16)
-    if not down:
-        lparam |= 0xC0000000
-    if not user32.PostMessageW(hwnd, message, vk, lparam):
+    flags = 0 if down else KEYEVENTF_KEYUP
+    event = INPUT(
+        type=INPUT_KEYBOARD,
+        ki=KEYBDINPUT(wVk=vk, wScan=scan_code, dwFlags=flags, time=0, dwExtraInfo=0),
+    )
+    if user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) != 1:
         raise ctypes.WinError()
 
 
@@ -116,11 +149,15 @@ def main():
     hwnd, title = match
     vk = KEYS[args.key]
     print(f"Target: {title} (0x{hwnd:08X}); holding {args.key} for {args.seconds:.2f}s")
-    post_key(hwnd, vk, True)
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    if not user32.SetForegroundWindow(hwnd):
+        raise ctypes.WinError()
+
+    send_input_key(vk, True)
     try:
         time.sleep(args.seconds)
     finally:
-        post_key(hwnd, vk, False)
+        send_input_key(vk, False)
     print("Key released.")
     return 0
 
