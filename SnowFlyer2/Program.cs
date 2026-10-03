@@ -112,6 +112,7 @@ namespace SnowFlyer2
         private const uint MemoryCommit = 0x1000;
         private const uint PageGuard = 0x100;
         private const uint PageNoAccess = 0x01;
+        private const uint MemPrivate = 0x20000;
         private const int CameraScanRadius = 300;
         private const int CameraScanVerticalRadius = 100;
         private const int CameraScanChunkSize = 1024 * 1024;
@@ -1377,7 +1378,10 @@ namespace SnowFlyer2
                 if (regionSize <= 0)
                     break;
 
-                if (region.State == MemoryCommit && IsReadable(region.Protect))
+                // Module references are searched separately. For the fallback heap
+                // pass, skip image and mapped regions so a pointer search does not
+                // spend minutes rereading executable and file-backed memory.
+                if (region.State == MemoryCommit && region.Type == MemPrivate && IsReadable(region.Protect))
                 {
                     for (long offset = 0; offset < regionSize && references.Count < 5000; offset += CameraScanChunkSize)
                     {
