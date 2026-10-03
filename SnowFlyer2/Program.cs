@@ -581,7 +581,18 @@ namespace SnowFlyer2
                         string location = reference.ReferenceOffset >= 0
                             ? $"SnowRunner.exe+0x{reference.ReferenceOffset:X}"
                             : $"0x{reference.ReferenceAddress.ToInt64():X}";
-                        Console.WriteLine($"{location} -> stable slot 0x{reference.Candidate.ToInt64():X} + 0x{reference.Delta:X}");
+                        long stableSlotAddress = reference.Candidate.ToInt64() - reference.Delta;
+                        var firstLevelMatch = references.FirstOrDefault(
+                            first => first.ReferenceAddress.ToInt64() == stableSlotAddress);
+                        if (firstLevelMatch.ReferenceAddress != IntPtr.Zero)
+                        {
+                            Console.WriteLine($"{location} -> stable slot 0x{reference.Candidate.ToInt64():X} + 0x{reference.Delta:X} -> " +
+                                $"candidate 0x{firstLevelMatch.Candidate.ToInt64():X} + 0x{firstLevelMatch.Delta:X}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{location} -> stable slot 0x{reference.Candidate.ToInt64():X} + 0x{reference.Delta:X}");
+                        }
                     }
                 }
 
