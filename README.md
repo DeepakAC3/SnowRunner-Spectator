@@ -24,8 +24,8 @@ This branch adds a first reverse-engineering aid for the spectator project:
 - `Ctrl+F7` searches pointer references after the candidate set is narrow.
 - `Ctrl+F8` resets the camera scan when a movement sequence selects unrelated
   vectors.
-- `Ctrl+F9` probes the currently known fast camera pointer chain.
-- `Ctrl+F10` starts or stops continuous camera position tracking through the fast pointer chain.
+- `Ctrl+F9` probes the legacy player/rig pointer chain discovered during testing.
+- `Ctrl+F10` starts or stops read-only tracking through that legacy player/rig chain.
 - `Ctrl+F11` reads one camera-object snapshot and dumps nearby normalized vectors for orientation discovery.
 - `Ctrl+F12` is reserved for camera follow while the writable camera state is being identified.
 - `Ctrl+Shift+F12` performs a one-unit camera-position nudge and restores it on the next press.
@@ -63,6 +63,10 @@ p = tilt anticlockwise
 
 The helper only sends input to the selected SnowRunner window. It does not write
 camera or vehicle memory.
+
+The legacy pointer chain is not the rendered freecam position. Camera writes stay
+disabled until a separate transform has been validated; this avoids the character
+head and rig glitches seen during early write experiments.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
