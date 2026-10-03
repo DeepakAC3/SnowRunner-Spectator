@@ -95,6 +95,7 @@ namespace SnowFlyer2
         private static Dictionary<IntPtr, Vector3> CameraScanBaseline;
         private static Vector3 CameraScanCenter;
         private static List<IntPtr> LastCameraCandidateAddresses = new List<IntPtr>();
+        private static HashSet<IntPtr> LastPointerReferenceAddresses = new HashSet<IntPtr>();
 
         private const uint ProcessQueryInformation = 0x0400;
         private const uint ProcessVmRead = 0x0010;
@@ -566,6 +567,18 @@ namespace SnowFlyer2
                 }
 
                 Console.WriteLine($"Pointer references: {references.Count}");
+                var currentReferenceAddresses = new HashSet<IntPtr>(
+                    references.Select(reference => reference.ReferenceAddress));
+                if (LastPointerReferenceAddresses.Count > 0)
+                {
+                    var stableReferences = currentReferenceAddresses
+                        .Where(address => LastPointerReferenceAddresses.Contains(address))
+                        .ToList();
+                    Console.WriteLine($"Stable reference addresses across scans: {stableReferences.Count}");
+                    foreach (IntPtr stableAddress in stableReferences.Take(50))
+                        Console.WriteLine($"Stable: 0x{stableAddress.ToInt64():X}");
+                }
+
                 foreach (var reference in references.Take(50))
                 {
                     string location = reference.ReferenceOffset >= 0
@@ -574,6 +587,7 @@ namespace SnowFlyer2
                     Console.WriteLine($"{location} -> " +
                         $"candidate 0x{reference.Candidate.ToInt64():X} + 0x{reference.Delta:X}");
                 }
+                LastPointerReferenceAddresses = currentReferenceAddresses;
             }
             finally
             {
