@@ -668,10 +668,28 @@ namespace SnowFlyer2
                     return;
                 }
 
-                Console.WriteLine($"Camera object base: 0x{cameraBase:X}. Nearby normalized vectors:");
+                const int snapshotStart = 0x100;
+                const int snapshotSize = 0x200;
+                byte[] snapshot = new byte[snapshotSize];
+                if (!TryReadBytes(processHandle,
+                    new IntPtr(cameraBase + snapshotStart),
+                    snapshot))
+                {
+                    Console.WriteLine("Could not read a consistent camera-object snapshot.");
+                    return;
+                }
+
+                Console.WriteLine($"Camera object base: 0x{cameraBase:X}. " +
+                    $"Snapshot: +0x{snapshotStart:X}-+0x{snapshotStart + snapshotSize - 1:X}.");
+                Console.WriteLine("Nearby normalized vectors from one read:");
                 for (int offset = 0x100; offset <= 0x280; offset += 4)
                 {
-                    if (!TryReadVector3(processHandle, new IntPtr(cameraBase + offset), out Vector3 value) ||
+                    int snapshotOffset = offset - snapshotStart;
+                    Vector3 value = new Vector3(
+                        BitConverter.ToSingle(snapshot, snapshotOffset),
+                        BitConverter.ToSingle(snapshot, snapshotOffset + 4),
+                        BitConverter.ToSingle(snapshot, snapshotOffset + 8));
+                    if (!IsFiniteVector(value) ||
                         value.LengthSquared() < 0.0001f || value.LengthSquared() > 4.0f)
                         continue;
 
@@ -1175,8 +1193,7 @@ namespace SnowFlyer2
         {
             value = default;
             byte[] buffer = new byte[12];
-            if (!ReadProcessMemory(processHandle, address, buffer, buffer.Length, out IntPtr bytesRead) ||
-                bytesRead.ToInt32() != buffer.Length)
+            if (!TryReadBytes(processHandle, address, buffer))
                 return false;
 
             value = new Vector3(
@@ -1184,6 +1201,12 @@ namespace SnowFlyer2
                 BitConverter.ToSingle(buffer, 4),
                 BitConverter.ToSingle(buffer, 8));
             return IsFiniteVector(value);
+        }
+
+        private static bool TryReadBytes(IntPtr processHandle, IntPtr address, byte[] buffer)
+        {
+            return ReadProcessMemory(processHandle, address, buffer, buffer.Length, out IntPtr bytesRead) &&
+                bytesRead.ToInt64() == buffer.Length;
         }
 
         private static bool TryWriteVector3(IntPtr processHandle, IntPtr address, Vector3 value)
