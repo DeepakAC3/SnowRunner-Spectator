@@ -96,6 +96,7 @@ namespace SnowFlyer2
         private static Vector3 CameraScanCenter;
         private static List<IntPtr> LastCameraCandidateAddresses = new List<IntPtr>();
         private static HashSet<IntPtr> LastPointerReferenceAddresses = new HashSet<IntPtr>();
+        private static CameraPointerChain? ActiveCameraPointerChain;
 
         private const uint ProcessQueryInformation = 0x0400;
         private const uint ProcessVmRead = 0x0010;
@@ -333,6 +334,7 @@ namespace SnowFlyer2
                     HasCameraScanBaseline = true;
                     LastCameraCandidateAddresses.Clear();
                     LastPointerReferenceAddresses.Clear();
+                    ActiveCameraPointerChain = null;
                     Console.WriteLine($"Initial scan captured {CameraScanBaseline.Count} candidate vectors. Move the free camera, then press Ctrl+F6 again.");
                     return;
                 }
@@ -344,6 +346,7 @@ namespace SnowFlyer2
                     HasCameraScanBaseline = false;
                     CameraScanBaseline = null;
                     LastCameraCandidateAddresses.Clear();
+                    ActiveCameraPointerChain = null;
                     Console.WriteLine("No tracked candidates changed. Move the free camera farther and press Ctrl+F6 again.");
                     return;
                 }
@@ -396,6 +399,7 @@ namespace SnowFlyer2
                 HasCameraScanBaseline = false;
                 CameraScanBaseline = null;
                 LastCameraCandidateAddresses.Clear();
+                ActiveCameraPointerChain = null;
                 Console.WriteLine($"Camera scan failed: {ex.Message}");
             }
         }
@@ -583,6 +587,25 @@ namespace SnowFlyer2
                         secondLevelReferences = ScanAllMemoryForPointerReferences(processHandle, secondLevelTargets);
 
                     Console.WriteLine($"Second-level references to stable heap slots: {secondLevelReferences.Count}");
+                    var verifiedChains = secondLevelReferences
+                        .Select(reference => TryBuildCameraPointerChain(
+                            processHandle, snowRunnerProcess.MainModule.BaseAddress, reference, references))
+                        .Where(result => result.HasValue)
+                        .Select(result => result.Value)
+                        .GroupBy(result => result.Chain)
+                        .Select(group => group.First())
+                        .ToList();
+                    Console.WriteLine($"Verified camera pointer chains: {verifiedChains.Count}");
+                    foreach (var verified in verifiedChains.Take(20))
+                    {
+                        Console.WriteLine($"SnowRunner.exe+0x{verified.Chain.ModuleOffset:X} -> " +
+                            $"[ptr]+0x{verified.Chain.StableOffset:X} -> " +
+                            $"[ptr]+0x{verified.Chain.VectorOffset:X} = " +
+                            $"{verified.Value.X:F2},{verified.Value.Y:F2},{verified.Value.Z:F2}");
+                    }
+                    if (verifiedChains.Count > 0)
+                        ActiveCameraPointerChain = verifiedChains[0].Chain;
+
                     foreach (var reference in secondLevelReferences.Take(40))
                     {
                         string location = reference.ReferenceOffset >= 0
@@ -625,6 +648,117 @@ namespace SnowFlyer2
             public IntPtr ReferenceAddress;
             public IntPtr Candidate;
             public int Delta;
+        }
+
+        private struct CameraPointerChain : IEquatable<CameraPointerChain>
+        {
+            public long ModuleOffset;
+            public int StableOffset;
+            public int VectorOffset;
+
+            public bool Equals(CameraPointerChain other)
+            {
+                return ModuleOffset == other.ModuleOffset &&
+                       StableOffset == other.StableOffset &&
+                       VectorOffset == other.VectorOffset;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is CameraPointerChain other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int hash = ModuleOffset.GetHashCode();
+                    hash = (hash * 397) ^ StableOffset;
+                    return (hash * 397) ^ VectorOffset;
+                }
+            }
+        }
+
+        private struct VerifiedCameraChain
+        {
+            public CameraPointerChain Chain;
+            public Vector3 Value;
+        }
+
+        private static VerifiedCameraChain? TryBuildCameraPointerChain(
+            IntPtr processHandle,
+            IntPtr moduleBase,
+            PointerReference secondLevelReference,
+            List<PointerReference> firstLevelReferences)
+        {
+            if (secondLevelReference.ReferenceOffset < 0)
+                return null;
+
+            var firstLevelMatch = firstLevelReferences.FirstOrDefault(first =>
+                first.ReferenceAddress.ToInt64() ==
+                secondLevelReference.Candidate.ToInt64() - secondLevelReference.Delta);
+            if (firstLevelMatch.ReferenceAddress == IntPtr.Zero)
+                return null;
+
+            if (!TryReadPointer(processHandle,
+                new IntPtr(moduleBase.ToInt64() + secondLevelReference.ReferenceOffset),
+                out long rootValue))
+                return null;
+
+            long stableSlotAddress = rootValue + secondLevelReference.Delta;
+            if (stableSlotAddress != firstLevelMatch.ReferenceAddress.ToInt64())
+                return null;
+
+            if (!TryReadPointer(processHandle,
+                new IntPtr(stableSlotAddress),
+                out long vectorBaseValue))
+                return null;
+
+            long vectorAddress = vectorBaseValue + firstLevelMatch.Delta;
+            if (vectorAddress != firstLevelMatch.Candidate.ToInt64())
+                return null;
+
+            if (!TryReadVector3(processHandle, new IntPtr(vectorAddress), out Vector3 value) ||
+                !IsNearCameraSearchArea(value, CameraScanCenter, CameraScanRadius, CameraScanRadius * CameraScanRadius))
+                return null;
+
+            return new VerifiedCameraChain
+            {
+                Chain = new CameraPointerChain
+                {
+                    ModuleOffset = secondLevelReference.ReferenceOffset,
+                    StableOffset = secondLevelReference.Delta,
+                    VectorOffset = firstLevelMatch.Delta
+                },
+                Value = value
+            };
+        }
+
+        private static bool TryReadPointer(IntPtr processHandle, IntPtr address, out long value)
+        {
+            value = 0;
+            byte[] buffer = new byte[8];
+            if (!ReadProcessMemory(processHandle, address, buffer, buffer.Length, out IntPtr bytesRead) ||
+                bytesRead.ToInt32() != buffer.Length)
+                return false;
+
+            value = BitConverter.ToInt64(buffer, 0);
+            return value != 0;
+        }
+
+        private static bool TryReadVector3(IntPtr processHandle, IntPtr address, out Vector3 value)
+        {
+            value = default;
+            byte[] buffer = new byte[12];
+            if (!ReadProcessMemory(processHandle, address, buffer, buffer.Length, out IntPtr bytesRead) ||
+                bytesRead.ToInt32() != buffer.Length)
+                return false;
+
+            value = new Vector3(
+                BitConverter.ToSingle(buffer, 0),
+                BitConverter.ToSingle(buffer, 4),
+                BitConverter.ToSingle(buffer, 8));
+            return IsFiniteVector(value);
         }
 
         private static Dictionary<long, List<PointerTarget>> BuildPointerTargets(IEnumerable<IntPtr> addresses)
