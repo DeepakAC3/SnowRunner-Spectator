@@ -27,10 +27,12 @@ This branch adds a first reverse-engineering aid for the spectator project:
 - `Ctrl+F9` probes the currently known fast camera pointer chain.
 - `Ctrl+F10` starts or stops continuous camera position tracking through the fast pointer chain.
 - `Ctrl+F11` dumps nearby normalized vectors from the camera object for orientation discovery.
-- `Ctrl+F12` starts or stops camera follow mode, preserving the current camera offset from the player.
+- `Ctrl+F12` is reserved for camera follow while the writable camera state is being identified.
+- `Ctrl+Shift+F12` performs a one-unit camera-position nudge and restores it on the next press.
 
 ## TODO
 
+- Identify and validate the writable camera state for positioning and follow mode.
 - Record and replay camera paths.
 
 Use the tracker in single-player first. It should print lines in this form while

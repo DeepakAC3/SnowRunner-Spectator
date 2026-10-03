@@ -94,6 +94,8 @@ namespace SnowFlyer2
         private static bool IsTrackingCameraCoords = false;
         private static bool IsFollowingPlayer = false;
         private static Vector3 CameraFollowOffset;
+        private static bool HasCameraNudge = false;
+        private static Vector3 CameraNudgeOriginalPosition;
         private static bool HasCameraScanBaseline = false;
         private static Dictionary<IntPtr, Vector3> CameraScanBaseline;
         private static Vector3 CameraScanCenter;
@@ -118,6 +120,7 @@ namespace SnowFlyer2
         private const int KnownCameraRotationOffsetA = 0x170;
         private const int KnownCameraRotationOffsetB = 0x180;
         private const int KnownCameraRotationOffsetC = 0x190;
+        private static readonly bool EnableExperimentalCameraWrites = false;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
@@ -173,6 +176,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.ToggleCameraTracking, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ProbeCameraTransform, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleCameraFollow, KeyModifiers.Control);
+            HotKeyManager.RegisterHotKey(config.NudgeCameraPosition, KeyModifiers.Control | KeyModifiers.Shift);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -488,6 +492,18 @@ namespace SnowFlyer2
                 return;
             }
 
+            if (!IsFreeCamActive)
+            {
+                Console.WriteLine("Camera follow requires freecam. Press Ctrl+F1 first.");
+                return;
+            }
+
+            if (!EnableExperimentalCameraWrites)
+            {
+                Console.WriteLine("Camera follow writes are disabled while the writable camera state is being identified.");
+                return;
+            }
+
             if (!TryReadKnownCameraVector(snowRunnerProcess, out Vector3 cameraPosition) ||
                 !TryReadPlayerCoords(snowRunnerProcess, out Vector3 playerPosition))
             {
@@ -500,6 +516,69 @@ namespace SnowFlyer2
             Task.Run(() => TrackCameraFollow(snowRunnerProcess));
             Console.WriteLine($"Camera follow started with offset {CameraFollowOffset.X:F2} " +
                 $"{CameraFollowOffset.Y:F2} {CameraFollowOffset.Z:F2}.");
+        }
+
+        private static void NudgeCameraPosition(Process snowRunnerProcess)
+        {
+            if (!IsFreeCamActive)
+            {
+                Console.WriteLine("Camera position nudge requires freecam. Press Ctrl+F1 first.");
+                return;
+            }
+
+            IntPtr processHandle = OpenProcess(
+                ProcessQueryInformation | ProcessVmRead | ProcessVmWrite | ProcessVmOperation,
+                false,
+                snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+            {
+                Console.WriteLine("Could not open SnowRunner for the camera position nudge.");
+                return;
+            }
+
+            try
+            {
+                IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
+                if (!TryReadKnownCameraBase(processHandle, moduleBase, out long cameraBase) ||
+                    !TryReadVector3(processHandle,
+                        new IntPtr(cameraBase + KnownCameraVectorOffset),
+                        out Vector3 currentPosition))
+                {
+                    Console.WriteLine("Known camera position did not resolve.");
+                    return;
+                }
+
+                Vector3 targetPosition;
+                if (HasCameraNudge)
+                {
+                    targetPosition = CameraNudgeOriginalPosition;
+                }
+                else
+                {
+                    CameraNudgeOriginalPosition = currentPosition;
+                    targetPosition = currentPosition + new Vector3(0.0f, 1.0f, 0.0f);
+                }
+
+                if (!TryWriteVector3(processHandle,
+                    new IntPtr(cameraBase + KnownCameraVectorOffset),
+                    targetPosition) ||
+                    !TryReadVector3(processHandle,
+                        new IntPtr(cameraBase + KnownCameraVectorOffset),
+                        out Vector3 writtenPosition) ||
+                    Vector3.DistanceSquared(targetPosition, writtenPosition) > 0.01f)
+                {
+                    Console.WriteLine("Camera position nudge did not read back correctly.");
+                    return;
+                }
+
+                HasCameraNudge = !HasCameraNudge;
+                Console.WriteLine($"Camera position {(HasCameraNudge ? "nudged" : "restored")}: " +
+                    $"{writtenPosition.X:F2} {writtenPosition.Y:F2} {writtenPosition.Z:F2}");
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
         }
 
         private static void TrackCameraFollow(Process snowRunnerProcess)
@@ -539,7 +618,11 @@ namespace SnowFlyer2
                     Vector3 targetPosition = playerPosition + CameraFollowOffset;
                     if (!TryWriteVector3(processHandle,
                         new IntPtr(cameraBase + KnownCameraVectorOffset),
-                        targetPosition))
+                        targetPosition) ||
+                        !TryReadVector3(processHandle,
+                            new IntPtr(cameraBase + KnownCameraVectorOffset),
+                            out Vector3 writtenPosition) ||
+                        Vector3.DistanceSquared(targetPosition, writtenPosition) > 0.25f)
                     {
                         IsFollowingPlayer = false;
                         Console.WriteLine("Camera follow could not write the camera position.");
@@ -1521,6 +1604,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.ToggleCameraTracking +": \t Toggle continuous camera tracking\n");
             Console.WriteLine("Ctrl + "+ config.ProbeCameraTransform +": \t Dump nearby camera transform vectors\n");
             Console.WriteLine("Ctrl + "+ config.ToggleCameraFollow +": \t Toggle camera follow mode\n");
+            Console.WriteLine("Ctrl + Shift + "+ config.NudgeCameraPosition +": \t Nudge and restore the candidate camera position\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -1610,9 +1694,14 @@ namespace SnowFlyer2
             {
                 ProbeCameraTransform(snowRunnerProcess);
             }
-            else if (e2.Key == config.ToggleCameraFollow)
+            else if (e2.Key == config.ToggleCameraFollow && e2.Modifiers == KeyModifiers.Control)
             {
                 ToggleCameraFollow(snowRunnerProcess);
+            }
+            else if (e2.Key == config.NudgeCameraPosition &&
+                e2.Modifiers == (KeyModifiers.Control | KeyModifiers.Shift))
+            {
+                NudgeCameraPosition(snowRunnerProcess);
             }
             else
             {
