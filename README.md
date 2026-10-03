@@ -26,6 +26,7 @@ This branch adds a first reverse-engineering aid for the spectator project:
   vectors.
 - `Ctrl+F9` probes the currently known fast camera pointer chain.
 - `Ctrl+F10` starts or stops continuous camera position tracking through the fast pointer chain.
+- `Ctrl+F11` dumps nearby normalized vectors from the camera object for orientation discovery.
 
 Use the tracker in single-player first. It should print lines in this form while
 you drive:

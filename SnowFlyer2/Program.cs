@@ -161,6 +161,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.ResetCameraScan, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ProbeCameraChain, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleCameraTracking, KeyModifiers.Control);
+            HotKeyManager.RegisterHotKey(config.ProbeCameraTransform, KeyModifiers.Control);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -467,6 +468,40 @@ namespace SnowFlyer2
             Console.WriteLine("Camera coordinate tracking started.");
         }
 
+        private static void ProbeCameraTransform(Process snowRunnerProcess)
+        {
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+            {
+                Console.WriteLine("Could not open SnowRunner for the camera transform probe.");
+                return;
+            }
+
+            try
+            {
+                IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
+                if (!TryReadKnownCameraBase(processHandle, moduleBase, out long cameraBase))
+                {
+                    Console.WriteLine("Known camera chain did not resolve.");
+                    return;
+                }
+
+                Console.WriteLine($"Camera object base: 0x{cameraBase:X}. Nearby normalized vectors:");
+                for (int offset = 0x100; offset <= 0x280; offset += 4)
+                {
+                    if (!TryReadVector3(processHandle, new IntPtr(cameraBase + offset), out Vector3 value) ||
+                        value.LengthSquared() < 0.0001f || value.LengthSquared() > 4.0f)
+                        continue;
+
+                    Console.WriteLine($"  +0x{offset:X3}: {value.X:F4}, {value.Y:F4}, {value.Z:F4}");
+                }
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
+        }
+
         private static void TrackCameraCoords(Process snowRunnerProcess)
         {
             IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
@@ -507,10 +542,7 @@ namespace SnowFlyer2
         private static bool TryReadKnownCameraVector(IntPtr processHandle, IntPtr moduleBase, out Vector3 value)
         {
             value = default;
-            if (!TryReadPointer(processHandle,
-                new IntPtr(moduleBase.ToInt64() + KnownCameraModuleOffset),
-                out long stableSlot) ||
-                !TryReadPointer(processHandle, new IntPtr(stableSlot), out long vectorBase))
+            if (!TryReadKnownCameraBase(processHandle, moduleBase, out long vectorBase))
             {
                 return false;
             }
@@ -518,6 +550,17 @@ namespace SnowFlyer2
             return TryReadVector3(processHandle,
                 new IntPtr(vectorBase + KnownCameraVectorOffset),
                 out value);
+        }
+
+        private static bool TryReadKnownCameraBase(IntPtr processHandle, IntPtr moduleBase, out long vectorBase)
+        {
+            vectorBase = 0;
+            if (!TryReadPointer(processHandle,
+                new IntPtr(moduleBase.ToInt64() + KnownCameraModuleOffset),
+                out long stableSlot))
+                return false;
+
+            return TryReadPointer(processHandle, new IntPtr(stableSlot), out vectorBase);
         }
 
         private static bool TryReadPlayerCoords(Process snowRunnerProcess, out Vector3 playerVector)
@@ -1289,6 +1332,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.ResetCameraScan +": \t Reset camera scan candidates\n");
             Console.WriteLine("Ctrl + "+ config.ProbeCameraChain +": \t Probe the fast camera pointer chain\n");
             Console.WriteLine("Ctrl + "+ config.ToggleCameraTracking +": \t Toggle continuous camera tracking\n");
+            Console.WriteLine("Ctrl + "+ config.ProbeCameraTransform +": \t Dump nearby camera transform vectors\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -1373,6 +1417,10 @@ namespace SnowFlyer2
             else if (e2.Key == config.ToggleCameraTracking)
             {
                 ToggleCameraCoordTracking(snowRunnerProcess);
+            }
+            else if (e2.Key == config.ProbeCameraTransform)
+            {
+                ProbeCameraTransform(snowRunnerProcess);
             }
             else
             {
