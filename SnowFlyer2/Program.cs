@@ -88,6 +88,7 @@ namespace SnowFlyer2
         private static bool IsFreeCamActive = false;
         private static bool ShouldLoopTime = false;
         private static bool IsTimePassing = true;
+        private static bool IsTrackingPlayerCoords = false;
 
         [STAThread]
         static void Main(string[] args)
@@ -100,6 +101,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.ToggleFreezeTime, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleTimeLapseMode, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.GetPlayerLocation, KeyModifiers.Control);
+            HotKeyManager.RegisterHotKey(config.TogglePlayerTracking, KeyModifiers.Control);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -197,6 +199,67 @@ namespace SnowFlyer2
 
                 var playerVec = PlayerCoord.Read();
                 Console.WriteLine($"Coord: {playerVec.X:F2} {playerVec.Y:F2} {playerVec.Z:F2}");
+            }
+        }
+
+        private static void TogglePlayerCoordTracking(Process snowRunnerProcess)
+        {
+            if (IsTrackingPlayerCoords)
+            {
+                IsTrackingPlayerCoords = false;
+                Console.WriteLine("Player coordinate tracking stopped.");
+                return;
+            }
+
+            IsTrackingPlayerCoords = true;
+            Task.Run(() => TrackPlayerCoords(snowRunnerProcess));
+            Console.WriteLine("Player coordinate tracking started.");
+        }
+
+        private static void TrackPlayerCoords(Process snowRunnerProcess)
+        {
+            try
+            {
+                var scanner = new Scanner(snowRunnerProcess, snowRunnerProcess.MainModule);
+                var coordsPtr = scanner.CompiledFindPattern(PatternPlayerCoords);
+
+                if (!coordsPtr.Found)
+                {
+                    Console.WriteLine("Player coordinate pattern was not found.");
+                    IsTrackingPlayerCoords = false;
+                    return;
+                }
+
+                var memory = new ExternalMemory(snowRunnerProcess);
+                var snowRunnerBase = snowRunnerProcess.MainModule.BaseAddress;
+                var playerCoordsBasePtr = ReadOffsetFromCallToLeaSingleton(
+                    memory,
+                    snowRunnerBase + coordsPtr.Offset + GetOpcodeLengthOfPattern(PatternPlayerCoords));
+
+                if (playerCoordsBasePtr == IntPtr.Zero)
+                {
+                    Console.WriteLine("Player coordinate pointer was null.");
+                    IsTrackingPlayerCoords = false;
+                    return;
+                }
+
+                int[] playerCoordsOffsets = { 0x28, 0x18, 0x1A8 };
+                var playerCoord = new StructPointerDescription<Vector3>(
+                    memory,
+                    playerCoordsBasePtr,
+                    playerCoordsOffsets);
+
+                while (IsTrackingPlayerCoords)
+                {
+                    var playerVec = playerCoord.Read();
+                    Console.WriteLine($"LOCAL: {playerVec.X:F2} {playerVec.Y:F2} {playerVec.Z:F2}");
+                    Thread.Sleep(250);
+                }
+            }
+            catch (Exception ex)
+            {
+                IsTrackingPlayerCoords = false;
+                Console.WriteLine($"Player coordinate tracking failed: {ex.Message}");
             }
         }
 
@@ -448,6 +511,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.ToggleFreezeTime +": \t Toggle in-game time\n");
             Console.WriteLine("Ctrl + "+ config.ToggleTimeLapseMode +": \t Toggle timelapse\n");
             Console.WriteLine("Ctrl + "+ config.GetPlayerLocation +": \t Get player location\n");
+            Console.WriteLine("Ctrl + "+ config.TogglePlayerTracking +": \t Toggle continuous player tracking\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -508,6 +572,10 @@ namespace SnowFlyer2
             else if (e2.Key == config.GetPlayerLocation)
             {
                 GetPlayerCoords(snowRunnerProcess);
+            }
+            else if (e2.Key == config.TogglePlayerTracking)
+            {
+                TogglePlayerCoordTracking(snowRunnerProcess);
             }
             else
             {
