@@ -561,14 +561,17 @@ namespace SnowFlyer2
 
                 if (references.Count == 0)
                 {
-                    Console.WriteLine("No direct module references found within the first 0x400 bytes before the candidates.");
-                    return;
+                    Console.WriteLine("No direct module references. Searching all readable memory for heap references...");
+                    references = ScanAllMemoryForPointerReferences(processHandle, targets);
                 }
 
-                Console.WriteLine($"Module pointer references: {references.Count}");
+                Console.WriteLine($"Pointer references: {references.Count}");
                 foreach (var reference in references.Take(50))
                 {
-                    Console.WriteLine($"SnowRunner.exe+0x{reference.ReferenceOffset:X} -> " +
+                    string location = reference.ReferenceOffset >= 0
+                        ? $"SnowRunner.exe+0x{reference.ReferenceOffset:X}"
+                        : $"0x{reference.ReferenceAddress.ToInt64():X}";
+                    Console.WriteLine($"{location} -> " +
                         $"candidate 0x{reference.Candidate.ToInt64():X} + 0x{reference.Delta:X}");
                 }
             }
@@ -581,6 +584,7 @@ namespace SnowFlyer2
         private struct PointerReference
         {
             public long ReferenceOffset;
+            public IntPtr ReferenceAddress;
             public IntPtr Candidate;
             public int Delta;
         }
@@ -629,6 +633,61 @@ namespace SnowFlyer2
                                 references.Add(new PointerReference
                                 {
                                     ReferenceOffset = offset + index - moduleStart,
+                                    ReferenceAddress = new IntPtr(offset + index),
+                                    Candidate = match.Candidate,
+                                    Delta = match.Delta
+                                });
+                            }
+                        }
+                    }
+                }
+
+                long nextAddress = regionBase + regionSize;
+                if (nextAddress <= regionBase)
+                    break;
+                address = new IntPtr(nextAddress);
+            }
+
+            return references;
+        }
+
+        private static List<PointerReference> ScanAllMemoryForPointerReferences(
+            IntPtr processHandle,
+            Dictionary<long, List<PointerTarget>> targets)
+        {
+            var references = new List<PointerReference>();
+            IntPtr address = IntPtr.Zero;
+            int informationSize = Marshal.SizeOf(typeof(MemoryBasicInformation));
+
+            while (VirtualQueryEx(processHandle, address, out MemoryBasicInformation region, (uint)informationSize) != 0)
+            {
+                long regionBase = region.BaseAddress.ToInt64();
+                long regionSize = region.RegionSize.ToInt64();
+                if (regionSize <= 0)
+                    break;
+
+                if (region.State == MemoryCommit && IsReadable(region.Protect))
+                {
+                    for (long offset = 0; offset < regionSize && references.Count < 5000; offset += CameraScanChunkSize)
+                    {
+                        int bytesToRead = (int)Math.Min(CameraScanChunkSize, regionSize - offset);
+                        byte[] buffer = new byte[bytesToRead];
+                        if (!ReadProcessMemory(processHandle, new IntPtr(regionBase + offset), buffer, bytesToRead, out IntPtr bytesRead))
+                            continue;
+
+                        int available = Math.Min(bytesToRead, bytesRead.ToInt32());
+                        for (int index = 0; index + 8 <= available && references.Count < 5000; index += 8)
+                        {
+                            long value = BitConverter.ToInt64(buffer, index);
+                            if (!targets.TryGetValue(value, out List<PointerTarget> matches))
+                                continue;
+
+                            foreach (PointerTarget match in matches)
+                            {
+                                references.Add(new PointerReference
+                                {
+                                    ReferenceOffset = -1,
+                                    ReferenceAddress = new IntPtr(regionBase + offset + index),
                                     Candidate = match.Candidate,
                                     Delta = match.Delta
                                 });
