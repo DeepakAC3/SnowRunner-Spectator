@@ -1017,6 +1017,12 @@ namespace SnowFlyer2
                 if (TryReadKnownCameraBase(processHandle, moduleBase, out long knownCameraBase))
                 {
                     IntPtr knownCameraVector = new IntPtr(knownCameraBase + KnownCameraVectorOffset);
+                    if (!HasCameraScanBaseline &&
+                        TryReadVector3(processHandle, knownCameraVector, out Vector3 knownCameraPosition))
+                    {
+                        CameraScanCenter = knownCameraPosition;
+                    }
+
                     if (!candidateAddresses.Contains(knownCameraVector))
                     {
                         candidateAddresses.Add(knownCameraVector);
