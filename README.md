@@ -51,6 +51,19 @@ python tools/snowrunner_input.py --window SnowRunner d 1.5
 It sends one key-down, holds it for the requested number of seconds, and always
 sends the matching key-up.
 
+The freecam movement keys currently used by the helper are:
+
+```text
+i = front       k = back
+j = left        l = right
+o = up          u = down
+y = tilt clockwise
+p = tilt anticlockwise
+```
+
+The helper only sends input to the selected SnowRunner window. It does not write
+camera or vehicle memory.
+
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
 press compares only the surviving addresses from the previous capture. Use
