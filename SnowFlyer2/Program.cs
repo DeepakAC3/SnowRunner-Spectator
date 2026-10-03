@@ -118,6 +118,13 @@ namespace SnowFlyer2
         private const int CameraScanChunkSize = 1024 * 1024;
         private const int PointerSearchRange = 0x400;
         private const int CameraCandidateRetentionCount = 100;
+        // Rendered transform discovered through reversible freecam movements.
+        // Read-only: this render-state copy is not yet a validated writable source.
+        private const long RenderedCameraModuleOffset = 0x2A97EE0;
+        private const int RenderedCameraBasisOffsetA = 0x50;
+        private const int RenderedCameraBasisOffsetB = 0x60;
+        private const int RenderedCameraBasisOffsetC = 0x70;
+        // Legacy rig chain; never use it for rendered-camera diagnostics.
         private const long KnownCameraModuleOffset = 0x2A99E80;
         private const int KnownCameraVectorOffset = 0x1B8;
         private const int KnownCameraRotationOffsetA = 0x170;
@@ -440,7 +447,7 @@ namespace SnowFlyer2
             Console.WriteLine("Camera scan reset. Press Ctrl+F6 for a new initial scan.");
         }
 
-        private static void ProbeKnownCameraChain(Process snowRunnerProcess)
+        private static void ProbeRenderedCameraChain(Process snowRunnerProcess)
         {
             IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
             if (processHandle == IntPtr.Zero)
@@ -452,19 +459,16 @@ namespace SnowFlyer2
             try
             {
                 IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
-                if (!TryReadKnownCameraVector(processHandle, moduleBase, out Vector3 value))
+                if (!TryReadRenderedCameraVector(processHandle, moduleBase, out Vector3 value, out Vector3 stored))
                 {
-                    Console.WriteLine("Known camera chain did not resolve.");
+                    Console.WriteLine("Rendered camera chain did not resolve.");
                     return;
                 }
 
-                TryReadPointer(processHandle,
-                    new IntPtr(moduleBase.ToInt64() + KnownCameraModuleOffset),
-                    out long stableSlot);
-                TryReadPointer(processHandle, new IntPtr(stableSlot), out long vectorBase);
-                Console.WriteLine($"Known camera chain: SnowRunner.exe+0x{KnownCameraModuleOffset:X} -> " +
-                    $"0x{stableSlot:X} -> 0x{vectorBase + KnownCameraVectorOffset:X} = " +
-                    $"{value.X:F2},{value.Y:F2},{value.Z:F2}");
+                TryReadRenderedCameraBase(processHandle, moduleBase, out long cameraBase);
+                Console.WriteLine($"RENDERED CAMERA: SnowRunner.exe+0x{RenderedCameraModuleOffset:X} -> " +
+                    $"0x{cameraBase:X}; world XYZ = {value.X:F2},{value.Y:F2},{value.Z:F2}; " +
+                    $"stored ZYX = {stored.X:F2},{stored.Y:F2},{stored.Z:F2}");
             }
             finally
             {
@@ -665,14 +669,14 @@ namespace SnowFlyer2
             try
             {
                 IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
-                if (!TryReadKnownCameraBase(processHandle, moduleBase, out long cameraBase))
+                if (!TryReadRenderedCameraBase(processHandle, moduleBase, out long cameraBase))
                 {
-                    Console.WriteLine("Known camera chain did not resolve.");
+                    Console.WriteLine("Rendered camera chain did not resolve.");
                     return;
                 }
 
-                const int snapshotStart = 0x100;
-                const int snapshotSize = 0x200;
+                const int snapshotStart = 0;
+                const int snapshotSize = 0x100;
                 byte[] snapshot = new byte[snapshotSize];
                 if (!TryReadBytes(processHandle,
                     new IntPtr(cameraBase + snapshotStart),
@@ -682,17 +686,17 @@ namespace SnowFlyer2
                     return;
                 }
 
-                Console.WriteLine($"Camera object base: 0x{cameraBase:X}. " +
+                Console.WriteLine($"Rendered camera transform: 0x{cameraBase:X}. " +
                     $"Snapshot: +0x{snapshotStart:X}-+0x{snapshotStart + snapshotSize - 1:X}.");
-                Vector3 positionCandidate = ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraVectorOffset);
-                Console.WriteLine($"Position candidate +0x{KnownCameraVectorOffset:X3}: " +
-                    $"{positionCandidate.X:F2}, {positionCandidate.Y:F2}, {positionCandidate.Z:F2}");
-                Console.WriteLine($"Basis candidates: +0x{KnownCameraRotationOffsetA:X3} " +
-                    $"{ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraRotationOffsetA)}, " +
-                    $"+0x{KnownCameraRotationOffsetB:X3} " +
-                    $"{ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraRotationOffsetB)}, " +
-                    $"+0x{KnownCameraRotationOffsetC:X3} " +
-                    $"{ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraRotationOffsetC)}");
+                Vector3 stored = ReadSnapshotVector3(snapshot, snapshotStart, 0);
+                Console.WriteLine($"RENDERED CAMERA: world XYZ {stored.Z:F2},{stored.Y:F2},{stored.X:F2}; " +
+                    $"stored ZYX {stored.X:F2},{stored.Y:F2},{stored.Z:F2}");
+                Console.WriteLine($"Basis candidates (stored order): +0x{RenderedCameraBasisOffsetA:X3} " +
+                    $"{ReadSnapshotVector3(snapshot, snapshotStart, RenderedCameraBasisOffsetA)}, " +
+                    $"+0x{RenderedCameraBasisOffsetB:X3} " +
+                    $"{ReadSnapshotVector3(snapshot, snapshotStart, RenderedCameraBasisOffsetB)}, " +
+                    $"+0x{RenderedCameraBasisOffsetC:X3} " +
+                    $"{ReadSnapshotVector3(snapshot, snapshotStart, RenderedCameraBasisOffsetC)}");
                 if (PreviousCameraSnapshot != null && PreviousCameraSnapshotBase == cameraBase)
                 {
                     var changedFields = new List<Tuple<int, float>>();
@@ -722,7 +726,7 @@ namespace SnowFlyer2
                 PreviousCameraSnapshot = snapshot;
                 PreviousCameraSnapshotBase = cameraBase;
                 Console.WriteLine("Nearby normalized vectors from one read:");
-                for (int offset = 0x100; offset <= 0x280; offset += 4)
+                for (int offset = snapshotStart; offset <= snapshotStart + snapshotSize - 12; offset += 4)
                 {
                     Vector3 value = ReadSnapshotVector3(snapshot, snapshotStart, offset);
                     if (!IsFiniteVector(value) ||
@@ -762,25 +766,15 @@ namespace SnowFlyer2
                 IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
                 while (IsTrackingCameraCoords)
                 {
-                    if (!TryReadKnownCameraVector(processHandle, moduleBase, out Vector3 value))
+                    if (!TryReadRenderedCameraVector(processHandle, moduleBase, out Vector3 value, out Vector3 stored))
                     {
-                        Console.WriteLine("Camera coordinate chain no longer resolves.");
+                        Console.WriteLine("Rendered camera coordinate chain no longer resolves.");
                         IsTrackingCameraCoords = false;
                         break;
                     }
 
-                    if (TryReadKnownCameraRotation(processHandle, moduleBase,
-                        out Vector3 rotationA, out Vector3 rotationB, out Vector3 rotationC))
-                    {
-                        Console.WriteLine($"CAMERA: {value.X:F2} {value.Y:F2} {value.Z:F2} | " +
-                            $"ROT: {rotationA.X:F3},{rotationA.Y:F3},{rotationA.Z:F3} / " +
-                            $"{rotationB.X:F3},{rotationB.Y:F3},{rotationB.Z:F3} / " +
-                            $"{rotationC.X:F3},{rotationC.Y:F3},{rotationC.Z:F3}");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"CAMERA: {value.X:F2} {value.Y:F2} {value.Z:F2}");
-                    }
+                    Console.WriteLine($"RENDERED CAMERA: world XYZ {value.X:F2} {value.Y:F2} {value.Z:F2} | " +
+                        $"stored ZYX {stored.X:F2} {stored.Y:F2} {stored.Z:F2}");
                     Thread.Sleep(250);
                 }
             }
@@ -793,6 +787,24 @@ namespace SnowFlyer2
             {
                 CloseHandle(processHandle);
             }
+        }
+
+        private static bool TryReadRenderedCameraBase(IntPtr processHandle, IntPtr moduleBase, out long cameraBase)
+        {
+            return TryReadPointer(processHandle,
+                new IntPtr(moduleBase.ToInt64() + RenderedCameraModuleOffset), out cameraBase);
+        }
+
+        private static bool TryReadRenderedCameraVector(
+            IntPtr processHandle, IntPtr moduleBase, out Vector3 world, out Vector3 stored)
+        {
+            world = default;
+            stored = default;
+            if (!TryReadRenderedCameraBase(processHandle, moduleBase, out long cameraBase) ||
+                !TryReadVector3(processHandle, new IntPtr(cameraBase), out stored) || !IsFiniteVector(stored))
+                return false;
+            world = new Vector3(stored.Z, stored.Y, stored.X);
+            return true;
         }
 
         private static bool TryReadKnownCameraVector(IntPtr processHandle, IntPtr moduleBase, out Vector3 value)
@@ -1034,7 +1046,8 @@ namespace SnowFlyer2
         {
             if (LastCameraCandidateAddresses.Count == 0)
             {
-                Console.WriteLine("No filtered scan candidates are available; searching the known camera vector directly.");
+                Console.WriteLine("No filtered candidates are available. Capture and narrow freecam movement with Ctrl+F6 before pointer tracing.");
+                return;
             }
 
             IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
@@ -1045,33 +1058,13 @@ namespace SnowFlyer2
             {
                 var candidateAddresses = LastCameraCandidateAddresses.ToList();
                 IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
-                if (TryReadKnownCameraBase(processHandle, moduleBase, out long knownCameraBase))
-                {
-                    IntPtr knownCameraVector = new IntPtr(knownCameraBase + KnownCameraVectorOffset);
-                    if (!HasCameraScanBaseline &&
-                        TryReadVector3(processHandle, knownCameraVector, out Vector3 knownCameraPosition))
-                    {
-                        CameraScanCenter = knownCameraPosition;
-                    }
-
-                    if (!candidateAddresses.Contains(knownCameraVector))
-                    {
-                        candidateAddresses.Add(knownCameraVector);
-                        Console.WriteLine($"Including the known camera vector 0x{knownCameraVector.ToInt64():X} in pointer search.");
-                    }
-                }
-
                 var targets = BuildPointerTargets(candidateAddresses);
 
                 long moduleStart = moduleBase.ToInt64();
                 long moduleEnd = moduleStart + snowRunnerProcess.MainModule.ModuleMemorySize;
-                var references = ScanModuleForPointerReferences(processHandle, moduleStart, moduleEnd, targets);
-
-                if (references.Count == 0)
-                {
-                    Console.WriteLine("No direct module references. Searching all readable memory for heap references...");
-                    references = ScanAllMemoryForPointerReferences(processHandle, targets);
-                }
+                var references = MergePointerReferences(
+                    ScanModuleForPointerReferences(processHandle, moduleStart, moduleEnd, targets),
+                    ScanAllMemoryForPointerReferences(processHandle, targets));
 
                 Console.WriteLine($"Pointer references: {references.Count}");
                 var currentReferenceAddresses = new HashSet<IntPtr>(
@@ -1086,13 +1079,12 @@ namespace SnowFlyer2
                         Console.WriteLine($"Stable: 0x{stableAddress.ToInt64():X}");
 
                     var secondLevelTargets = BuildPointerTargets(stableReferences);
-                    var secondLevelReferences = ScanModuleForPointerReferences(
-                        processHandle, moduleStart, moduleEnd, secondLevelTargets);
-                    if (secondLevelReferences.Count == 0)
-                        secondLevelReferences = ScanAllMemoryForPointerReferences(processHandle, secondLevelTargets);
+                    var secondLevelReferences = MergePointerReferences(
+                        ScanModuleForPointerReferences(processHandle, moduleStart, moduleEnd, secondLevelTargets),
+                        ScanAllMemoryForPointerReferences(processHandle, secondLevelTargets));
 
                     Console.WriteLine($"Second-level references to stable heap slots: {secondLevelReferences.Count}");
-                    var verifiedChains = secondLevelReferences
+                    var resolvedChains = secondLevelReferences
                         .Select(reference => TryBuildCameraPointerChain(
                             processHandle, snowRunnerProcess.MainModule.BaseAddress, reference, references))
                         .Where(result => result.HasValue)
@@ -1100,23 +1092,21 @@ namespace SnowFlyer2
                         .GroupBy(result => result.Chain)
                         .Select(group => group.First())
                         .ToList();
-                    Console.WriteLine($"Verified camera pointer chains: {verifiedChains.Count}");
-                    foreach (var verified in verifiedChains.Take(20))
+                    Console.WriteLine($"Structurally resolved candidate pointer chains: {resolvedChains.Count}. Rendered-camera identity still requires controlled movement checks.");
+                    foreach (var resolved in resolvedChains.Take(20))
                     {
-                        Console.WriteLine($"SnowRunner.exe+0x{verified.Chain.ModuleOffset:X} -> " +
-                            $"[ptr]+0x{verified.Chain.StableOffset:X} -> " +
-                            $"[ptr]+0x{verified.Chain.VectorOffset:X} = " +
-                            $"{verified.Value.X:F2},{verified.Value.Y:F2},{verified.Value.Z:F2}");
+                        Console.WriteLine($"SnowRunner.exe+0x{resolved.Chain.ModuleOffset:X} -> " +
+                            $"[ptr]+0x{resolved.Chain.StableOffset:X} -> " +
+                            $"[ptr]+0x{resolved.Chain.VectorOffset:X} = " +
+                            $"{resolved.Value.X:F2},{resolved.Value.Y:F2},{resolved.Value.Z:F2}");
                     }
-                    if (verifiedChains.Count > 0)
-                        ActiveCameraPointerChain = verifiedChains[0].Chain;
 
                     foreach (var reference in secondLevelReferences.Take(40))
                     {
                         string location = reference.ReferenceOffset >= 0
                             ? $"SnowRunner.exe+0x{reference.ReferenceOffset:X}"
                             : $"0x{reference.ReferenceAddress.ToInt64():X}";
-                        long stableSlotAddress = reference.Candidate.ToInt64() - reference.Delta;
+                        long stableSlotAddress = reference.Candidate.ToInt64();
                         var firstLevelMatch = references.FirstOrDefault(
                             first => first.ReferenceAddress.ToInt64() == stableSlotAddress);
                         if (firstLevelMatch.ReferenceAddress != IntPtr.Zero)
@@ -1155,6 +1145,21 @@ namespace SnowFlyer2
             public int Delta;
         }
 
+        private static List<PointerReference> MergePointerReferences(
+            List<PointerReference> moduleReferences,
+            List<PointerReference> heapReferences)
+        {
+            return moduleReferences.Concat(heapReferences)
+                .GroupBy(reference => new
+                {
+                    reference.ReferenceAddress,
+                    reference.Candidate,
+                    reference.Delta
+                })
+                .Select(group => group.First())
+                .ToList();
+        }
+
         private struct CameraPointerChain : IEquatable<CameraPointerChain>
         {
             public long ModuleOffset;
@@ -1184,13 +1189,13 @@ namespace SnowFlyer2
             }
         }
 
-        private struct VerifiedCameraChain
+        private struct ResolvedCandidateChain
         {
             public CameraPointerChain Chain;
             public Vector3 Value;
         }
 
-        private static VerifiedCameraChain? TryBuildCameraPointerChain(
+        private static ResolvedCandidateChain? TryBuildCameraPointerChain(
             IntPtr processHandle,
             IntPtr moduleBase,
             PointerReference secondLevelReference,
@@ -1201,7 +1206,7 @@ namespace SnowFlyer2
 
             var firstLevelMatch = firstLevelReferences.FirstOrDefault(first =>
                 first.ReferenceAddress.ToInt64() ==
-                secondLevelReference.Candidate.ToInt64() - secondLevelReference.Delta);
+                secondLevelReference.Candidate.ToInt64());
             if (firstLevelMatch.ReferenceAddress == IntPtr.Zero)
                 return null;
 
@@ -1227,7 +1232,7 @@ namespace SnowFlyer2
                 !IsNearCameraSearchArea(value, CameraScanCenter, CameraScanRadius, CameraScanRadius * CameraScanRadius))
                 return null;
 
-            return new VerifiedCameraChain
+            return new ResolvedCandidateChain
             {
                 Chain = new CameraPointerChain
                 {
@@ -1368,11 +1373,21 @@ namespace SnowFlyer2
             Dictionary<long, List<PointerTarget>> targets)
         {
             var references = new List<PointerReference>();
+            if (targets.Count == 0)
+                return references;
             IntPtr address = IntPtr.Zero;
             int informationSize = Marshal.SizeOf(typeof(MemoryBasicInformation));
+            var stopwatch = Stopwatch.StartNew();
+            long nextProgressSeconds = 5;
+            long scannedBytes = 0;
+            const int referenceLimit = 5000;
+            const int timeLimitSeconds = 60;
+            Console.WriteLine("Scanning private heap pointer references (60-second / 5000-reference limit)...");
 
             while (VirtualQueryEx(processHandle, address, out MemoryBasicInformation region, (uint)informationSize) != 0)
             {
+                if (references.Count >= referenceLimit || stopwatch.Elapsed.TotalSeconds >= timeLimitSeconds)
+                    break;
                 long regionBase = region.BaseAddress.ToInt64();
                 long regionSize = region.RegionSize.ToInt64();
                 if (regionSize <= 0)
@@ -1383,15 +1398,23 @@ namespace SnowFlyer2
                 // spend minutes rereading executable and file-backed memory.
                 if (region.State == MemoryCommit && region.Type == MemPrivate && IsReadable(region.Protect))
                 {
-                    for (long offset = 0; offset < regionSize && references.Count < 5000; offset += CameraScanChunkSize)
+                    for (long offset = 0; offset < regionSize && references.Count < referenceLimit; offset += CameraScanChunkSize)
                     {
+                        if (stopwatch.Elapsed.TotalSeconds >= timeLimitSeconds)
+                            break;
+                        if (stopwatch.Elapsed.TotalSeconds >= nextProgressSeconds)
+                        {
+                            Console.WriteLine($"Heap pointer scan: {scannedBytes / (1024 * 1024)} MiB read, {references.Count} references, {stopwatch.Elapsed.TotalSeconds:F0}s elapsed.");
+                            nextProgressSeconds = (long)stopwatch.Elapsed.TotalSeconds + 5;
+                        }
                         int bytesToRead = (int)Math.Min(CameraScanChunkSize, regionSize - offset);
                         byte[] buffer = new byte[bytesToRead];
                         if (!ReadProcessMemory(processHandle, new IntPtr(regionBase + offset), buffer, bytesToRead, out IntPtr bytesRead))
                             continue;
 
                         int available = Math.Min(bytesToRead, bytesRead.ToInt32());
-                        for (int index = 0; index + 8 <= available && references.Count < 5000; index += 8)
+                        scannedBytes += available;
+                        for (int index = 0; index + 8 <= available && references.Count < referenceLimit; index += 8)
                         {
                             long value = BitConverter.ToInt64(buffer, index);
                             if (!targets.TryGetValue(value, out List<PointerTarget> matches))
@@ -1399,6 +1422,8 @@ namespace SnowFlyer2
 
                             foreach (PointerTarget match in matches)
                             {
+                                if (references.Count >= referenceLimit)
+                                    break;
                                 references.Add(new PointerReference
                                 {
                                     ReferenceOffset = -1,
@@ -1417,6 +1442,10 @@ namespace SnowFlyer2
                 address = new IntPtr(nextAddress);
             }
 
+            if (references.Count >= referenceLimit || stopwatch.Elapsed.TotalSeconds >= timeLimitSeconds)
+                Console.WriteLine($"Heap pointer scan incomplete: reached {(references.Count >= referenceLimit ? "reference" : "time")} limit; returning partial results.");
+            else
+                Console.WriteLine($"Heap pointer scan completed: {scannedBytes / (1024 * 1024)} MiB read, {references.Count} references.");
             return references;
         }
 
@@ -1699,11 +1728,11 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.CaptureCameraScan +": \t Capture/compare freecam vectors\n");
             Console.WriteLine("Ctrl + "+ config.FindCameraPointers +": \t Find module references to camera candidates\n");
             Console.WriteLine("Ctrl + "+ config.ResetCameraScan +": \t Reset camera scan candidates\n");
-            Console.WriteLine("Ctrl + "+ config.ProbeCameraChain +": \t Probe the fast camera pointer chain\n");
-            Console.WriteLine("Ctrl + "+ config.ToggleCameraTracking +": \t Toggle continuous camera tracking\n");
-            Console.WriteLine("Ctrl + "+ config.ProbeCameraTransform +": \t Dump nearby camera transform vectors\n");
-            Console.WriteLine("Ctrl + "+ config.ToggleCameraFollow +": \t Toggle camera follow mode\n");
-            Console.WriteLine("Ctrl + Shift + "+ config.NudgeCameraPosition +": \t Nudge and restore the candidate camera position\n");
+            Console.WriteLine("Ctrl + "+ config.ProbeCameraChain +": \t Probe rendered camera position (read-only)\n");
+            Console.WriteLine("Ctrl + "+ config.ToggleCameraTracking +": \t Toggle rendered camera tracking (read-only)\n");
+            Console.WriteLine("Ctrl + "+ config.ProbeCameraTransform +": \t Dump rendered camera transform (read-only)\n");
+            Console.WriteLine("Ctrl + "+ config.ToggleCameraFollow +": \t Reserved for camera follow (writes disabled)\n");
+            Console.WriteLine("Ctrl + Shift + "+ config.NudgeCameraPosition +": \t Reserved for camera nudge (writes disabled)\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -1783,7 +1812,7 @@ namespace SnowFlyer2
             }
             else if (e2.Key == config.ProbeCameraChain)
             {
-                ProbeKnownCameraChain(snowRunnerProcess);
+                ProbeRenderedCameraChain(snowRunnerProcess);
             }
             else if (e2.Key == config.ToggleCameraTracking)
             {

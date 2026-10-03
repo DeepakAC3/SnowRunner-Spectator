@@ -22,13 +22,17 @@ This branch adds a first reverse-engineering aid for the spectator project:
 - `Ctrl+F6` performs the initial freecam vector scan, then narrows the same
   candidate set after each camera movement.
 - `Ctrl+F7` searches pointer references after the candidate set is narrow.
+  It searches both module data and private heap storage using only the filtered
+  candidates. Reported chains establish pointer structure; camera identity still
+  requires movement checks. Heap passes stop after 60 seconds or 5000 references
+  and explicitly report when results are incomplete.
 - `Ctrl+F8` resets the camera scan when a movement sequence selects unrelated
   vectors.
-- `Ctrl+F9` probes the legacy player/rig pointer chain discovered during testing.
-- `Ctrl+F10` starts or stops read-only tracking through that legacy player/rig chain.
-- `Ctrl+F11` reads one camera-object snapshot and dumps nearby normalized vectors for orientation discovery.
+- `Ctrl+F9` probes the rendered camera position through the newly identified chain.
+- `Ctrl+F10` starts or stops read-only rendered camera position tracking.
+- `Ctrl+F11` dumps the rendered camera transform and its nearby basis candidates.
 - `Ctrl+F12` is reserved for camera follow while the writable camera state is being identified.
-- `Ctrl+Shift+F12` performs a one-unit camera-position nudge and restores it on the next press.
+- `Ctrl+Shift+F12` is reserved for a camera-position nudge; writes are currently disabled.
 
 ## TODO
 
@@ -67,6 +71,13 @@ camera or vehicle memory.
 The legacy pointer chain is not the rendered freecam position. Camera writes stay
 disabled until a separate transform has been validated; this avoids the character
 head and rig glitches seen during early write experiments.
+
+Reversible freecam movements identified a rendered camera transform referenced
+directly by `SnowRunner.exe+0x2A97EE0`. Its first three floats store world coordinates
+in Z,Y,X order; diagnostics convert these to X,Y,Z. Basis candidates are at
+`+0x50`, `+0x60`, and `+0x70`. This is a render-state diagnostic: the writable
+camera source and follow control still need validation, including across game
+restarts. The former `+0x2A99E80` rig chain remains isolated from these diagnostics.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
