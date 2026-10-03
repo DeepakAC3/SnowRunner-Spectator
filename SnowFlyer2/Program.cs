@@ -681,14 +681,19 @@ namespace SnowFlyer2
 
                 Console.WriteLine($"Camera object base: 0x{cameraBase:X}. " +
                     $"Snapshot: +0x{snapshotStart:X}-+0x{snapshotStart + snapshotSize - 1:X}.");
+                Vector3 positionCandidate = ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraVectorOffset);
+                Console.WriteLine($"Position candidate +0x{KnownCameraVectorOffset:X3}: " +
+                    $"{positionCandidate.X:F2}, {positionCandidate.Y:F2}, {positionCandidate.Z:F2}");
+                Console.WriteLine($"Basis candidates: +0x{KnownCameraRotationOffsetA:X3} " +
+                    $"{ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraRotationOffsetA)}, " +
+                    $"+0x{KnownCameraRotationOffsetB:X3} " +
+                    $"{ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraRotationOffsetB)}, " +
+                    $"+0x{KnownCameraRotationOffsetC:X3} " +
+                    $"{ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraRotationOffsetC)}");
                 Console.WriteLine("Nearby normalized vectors from one read:");
                 for (int offset = 0x100; offset <= 0x280; offset += 4)
                 {
-                    int snapshotOffset = offset - snapshotStart;
-                    Vector3 value = new Vector3(
-                        BitConverter.ToSingle(snapshot, snapshotOffset),
-                        BitConverter.ToSingle(snapshot, snapshotOffset + 4),
-                        BitConverter.ToSingle(snapshot, snapshotOffset + 8));
+                    Vector3 value = ReadSnapshotVector3(snapshot, snapshotStart, offset);
                     if (!IsFiniteVector(value) ||
                         value.LengthSquared() < 0.0001f || value.LengthSquared() > 4.0f)
                         continue;
@@ -700,6 +705,15 @@ namespace SnowFlyer2
             {
                 CloseHandle(processHandle);
             }
+        }
+
+        private static Vector3 ReadSnapshotVector3(byte[] snapshot, int snapshotStart, int offset)
+        {
+            int snapshotOffset = offset - snapshotStart;
+            return new Vector3(
+                BitConverter.ToSingle(snapshot, snapshotOffset),
+                BitConverter.ToSingle(snapshot, snapshotOffset + 4),
+                BitConverter.ToSingle(snapshot, snapshotOffset + 8));
         }
 
         private static void TrackCameraCoords(Process snowRunnerProcess)
