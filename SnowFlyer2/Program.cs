@@ -111,6 +111,9 @@ namespace SnowFlyer2
         private const int CameraCandidateRetentionCount = 100;
         private const long KnownCameraModuleOffset = 0x2A99E80;
         private const int KnownCameraVectorOffset = 0x1B8;
+        private const int KnownCameraRotationOffsetA = 0x170;
+        private const int KnownCameraRotationOffsetB = 0x180;
+        private const int KnownCameraRotationOffsetC = 0x190;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
@@ -524,7 +527,18 @@ namespace SnowFlyer2
                         break;
                     }
 
-                    Console.WriteLine($"CAMERA: {value.X:F2} {value.Y:F2} {value.Z:F2}");
+                    if (TryReadKnownCameraRotation(processHandle, moduleBase,
+                        out Vector3 rotationA, out Vector3 rotationB, out Vector3 rotationC))
+                    {
+                        Console.WriteLine($"CAMERA: {value.X:F2} {value.Y:F2} {value.Z:F2} | " +
+                            $"ROT: {rotationA.X:F3},{rotationA.Y:F3},{rotationA.Z:F3} / " +
+                            $"{rotationB.X:F3},{rotationB.Y:F3},{rotationB.Z:F3} / " +
+                            $"{rotationC.X:F3},{rotationC.Y:F3},{rotationC.Z:F3}");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"CAMERA: {value.X:F2} {value.Y:F2} {value.Z:F2}");
+                    }
                     Thread.Sleep(250);
                 }
             }
@@ -561,6 +575,33 @@ namespace SnowFlyer2
                 return false;
 
             return TryReadPointer(processHandle, new IntPtr(stableSlot), out vectorBase);
+        }
+
+        private static bool TryReadKnownCameraRotation(
+            IntPtr processHandle,
+            IntPtr moduleBase,
+            out Vector3 rotationA,
+            out Vector3 rotationB,
+            out Vector3 rotationC)
+        {
+            rotationA = default;
+            rotationB = default;
+            rotationC = default;
+            if (!TryReadKnownCameraBase(processHandle, moduleBase, out long cameraBase) ||
+                !TryReadVector3(processHandle, new IntPtr(cameraBase + KnownCameraRotationOffsetA), out rotationA) ||
+                !TryReadVector3(processHandle, new IntPtr(cameraBase + KnownCameraRotationOffsetB), out rotationB) ||
+                !TryReadVector3(processHandle, new IntPtr(cameraBase + KnownCameraRotationOffsetC), out rotationC))
+                return false;
+
+            float lengthA = rotationA.Length();
+            float lengthB = rotationB.Length();
+            float lengthC = rotationC.Length();
+            return lengthA > 0.8f && lengthA < 1.2f &&
+                   lengthB > 0.8f && lengthB < 1.2f &&
+                   lengthC > 0.8f && lengthC < 1.2f &&
+                   Math.Abs(Vector3.Dot(rotationA, rotationB)) < 0.25f &&
+                   Math.Abs(Vector3.Dot(rotationA, rotationC)) < 0.25f &&
+                   Math.Abs(Vector3.Dot(rotationB, rotationC)) < 0.25f;
         }
 
         private static bool TryReadPlayerCoords(Process snowRunnerProcess, out Vector3 playerVector)
