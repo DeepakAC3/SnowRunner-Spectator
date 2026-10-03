@@ -42,6 +42,15 @@ you drive:
 LOCAL: X Y Z
 ```
 
+For a targeted held-key input, use the helper instead of the random macro:
+
+```text
+python tools/snowrunner_input.py --window SnowRunner d 1.5
+```
+
+It sends one key-down, holds it for the requested number of seconds, and always
+sends the matching key-up.
+
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
 press compares only the surviving addresses from the previous capture. Use
