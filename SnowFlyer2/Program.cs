@@ -331,19 +331,25 @@ namespace SnowFlyer2
                     CameraScanBaseline = ScanForVectorsNear(snowRunnerProcess, playerPosition, CameraScanRadius);
                     CameraScanCenter = playerPosition;
                     HasCameraScanBaseline = true;
-                    Console.WriteLine($"Captured {CameraScanBaseline.Count} candidate vectors. Move the free camera, then press Ctrl+F6 again.");
+                    LastCameraCandidateAddresses.Clear();
+                    LastPointerReferenceAddresses.Clear();
+                    Console.WriteLine($"Initial scan captured {CameraScanBaseline.Count} candidate vectors. Move the free camera, then press Ctrl+F6 again.");
                     return;
                 }
 
                 var changedCandidates = FindChangedCameraVectors(snowRunnerProcess, CameraScanBaseline);
-                HasCameraScanBaseline = false;
-                CameraScanBaseline = null;
 
                 if (changedCandidates.Count == 0)
                 {
-                    Console.WriteLine("No changed camera candidates found. Move the free camera farther and try Ctrl+F6 twice again.");
+                    HasCameraScanBaseline = false;
+                    CameraScanBaseline = null;
+                    LastCameraCandidateAddresses.Clear();
+                    Console.WriteLine("No tracked candidates changed. Move the free camera farther and press Ctrl+F6 again.");
                     return;
                 }
+
+                CameraScanBaseline = changedCandidates.ToDictionary(candidate => candidate.Address, candidate => candidate.After);
+                HasCameraScanBaseline = true;
 
                 Console.WriteLine($"Changed camera candidates: {changedCandidates.Count}");
                 var elevatedChanges = changedCandidates
@@ -353,12 +359,12 @@ namespace SnowFlyer2
                         (Vector3.DistanceSquared(candidate.Before, CameraScanCenter) > 4.0f ||
                          Vector3.DistanceSquared(candidate.After, CameraScanCenter) > 4.0f))
                     .OrderByDescending(candidate => candidate.Distance)
-                    .Take(20)
+                    .Take(CameraCandidateRetentionCount)
                     .ToList();
                 var smallChanges = changedCandidates
                     .Where(candidate => candidate.Distance <= 25.0f)
                     .OrderBy(candidate => candidate.Distance)
-                    .Take(20)
+                    .Take(CameraCandidateRetentionCount)
                     .ToList();
                 var results = elevatedChanges.Count > 0
                     ? elevatedChanges
@@ -366,10 +372,9 @@ namespace SnowFlyer2
                     ? smallChanges
                     : changedCandidates.Take(CameraCandidateRetentionCount).ToList();
 
-                LastCameraCandidateAddresses = LastCameraCandidateAddresses
-                    .Concat(results.Select(candidate => candidate.Address))
+                LastCameraCandidateAddresses = results.Select(candidate => candidate.Address)
                     .Distinct()
-                    .Take(CameraCandidateRetentionCount * 2)
+                    .Take(CameraCandidateRetentionCount)
                     .ToList();
 
                 if (elevatedChanges.Count > 0)
@@ -384,11 +389,13 @@ namespace SnowFlyer2
                         $"{candidate.After.X:F2},{candidate.After.Y:F2},{candidate.After.Z:F2} " +
                         $"(delta {candidate.Distance:F2})");
                 }
+                Console.WriteLine($"Tracking {CameraScanBaseline.Count} surviving addresses. Move the free camera, then press Ctrl+F6 again.");
             }
             catch (Exception ex)
             {
                 HasCameraScanBaseline = false;
                 CameraScanBaseline = null;
+                LastCameraCandidateAddresses.Clear();
                 Console.WriteLine($"Camera scan failed: {ex.Message}");
             }
         }
