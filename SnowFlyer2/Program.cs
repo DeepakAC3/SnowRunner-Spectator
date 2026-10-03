@@ -8,6 +8,8 @@ using Reloaded.Memory.Sigscan;
 using Reloaded.Memory.Sources;
 using System.Threading.Tasks;
 using System.Numerics;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 namespace SnowFlyer2
 {
@@ -89,6 +91,48 @@ namespace SnowFlyer2
         private static bool ShouldLoopTime = false;
         private static bool IsTimePassing = true;
         private static bool IsTrackingPlayerCoords = false;
+        private static bool HasCameraScanBaseline = false;
+        private static Dictionary<IntPtr, Vector3> CameraScanBaseline;
+
+        private const uint ProcessQueryInformation = 0x0400;
+        private const uint ProcessVmRead = 0x0010;
+        private const uint MemoryCommit = 0x1000;
+        private const uint PageGuard = 0x100;
+        private const uint PageNoAccess = 0x01;
+        private const int CameraScanRadius = 250;
+        private const int CameraScanChunkSize = 1024 * 1024;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern int VirtualQueryEx(IntPtr processHandle, IntPtr address, out MemoryBasicInformation buffer, uint length);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ReadProcessMemory(IntPtr processHandle, IntPtr baseAddress, byte[] buffer, int size, out IntPtr bytesRead);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MemoryBasicInformation
+        {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+
+        private struct CameraCandidate
+        {
+            public IntPtr Address;
+            public Vector3 Before;
+            public Vector3 After;
+            public float Distance;
+        }
 
         [STAThread]
         static void Main(string[] args)
@@ -102,6 +146,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.ToggleTimeLapseMode, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.GetPlayerLocation, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.TogglePlayerTracking, KeyModifiers.Control);
+            HotKeyManager.RegisterHotKey(config.CaptureCameraScan, KeyModifiers.Control);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -261,6 +306,200 @@ namespace SnowFlyer2
                 IsTrackingPlayerCoords = false;
                 Console.WriteLine($"Player coordinate tracking failed: {ex.Message}");
             }
+        }
+
+        private static void CaptureCameraScan(Process snowRunnerProcess)
+        {
+            try
+            {
+                if (!TryReadPlayerCoords(snowRunnerProcess, out Vector3 playerPosition))
+                {
+                    Console.WriteLine("Could not read the local player position for the camera scan.");
+                    return;
+                }
+
+                if (!HasCameraScanBaseline)
+                {
+                    Console.WriteLine($"Scanning for camera vectors near {playerPosition.X:F2} {playerPosition.Y:F2} {playerPosition.Z:F2}...");
+                    CameraScanBaseline = ScanForVectorsNear(snowRunnerProcess, playerPosition, CameraScanRadius);
+                    HasCameraScanBaseline = true;
+                    Console.WriteLine($"Captured {CameraScanBaseline.Count} candidate vectors. Move the free camera, then press Ctrl+F6 again.");
+                    return;
+                }
+
+                var changedCandidates = FindChangedCameraVectors(snowRunnerProcess, CameraScanBaseline);
+                HasCameraScanBaseline = false;
+                CameraScanBaseline = null;
+
+                if (changedCandidates.Count == 0)
+                {
+                    Console.WriteLine("No changed camera candidates found. Move the free camera farther and try Ctrl+F6 twice again.");
+                    return;
+                }
+
+                Console.WriteLine($"Changed camera candidates: {changedCandidates.Count}");
+                int resultCount = Math.Min(changedCandidates.Count, 20);
+                for (int i = 0; i < resultCount; i++)
+                {
+                    var candidate = changedCandidates[i];
+                    Console.WriteLine($"0x{candidate.Address.ToInt64():X}: " +
+                        $"{candidate.Before.X:F2},{candidate.Before.Y:F2},{candidate.Before.Z:F2} -> " +
+                        $"{candidate.After.X:F2},{candidate.After.Y:F2},{candidate.After.Z:F2} " +
+                        $"(delta {candidate.Distance:F2})");
+                }
+            }
+            catch (Exception ex)
+            {
+                HasCameraScanBaseline = false;
+                CameraScanBaseline = null;
+                Console.WriteLine($"Camera scan failed: {ex.Message}");
+            }
+        }
+
+        private static bool TryReadPlayerCoords(Process snowRunnerProcess, out Vector3 playerVector)
+        {
+            playerVector = default;
+            var scanner = new Scanner(snowRunnerProcess, snowRunnerProcess.MainModule);
+            var coordsPtr = scanner.CompiledFindPattern(PatternPlayerCoords);
+            if (!coordsPtr.Found)
+                return false;
+
+            var memory = new ExternalMemory(snowRunnerProcess);
+            var snowRunnerBase = snowRunnerProcess.MainModule.BaseAddress;
+            var playerCoordsBasePtr = ReadOffsetFromCallToLeaSingleton(
+                memory,
+                snowRunnerBase + coordsPtr.Offset + GetOpcodeLengthOfPattern(PatternPlayerCoords));
+            if (playerCoordsBasePtr == IntPtr.Zero)
+                return false;
+
+            var playerCoord = new StructPointerDescription<Vector3>(
+                memory,
+                playerCoordsBasePtr,
+                0x28,
+                0x18,
+                0x1A8);
+            playerVector = playerCoord.Read();
+            return IsFiniteVector(playerVector);
+        }
+
+        private static Dictionary<IntPtr, Vector3> ScanForVectorsNear(Process snowRunnerProcess, Vector3 center, float radius)
+        {
+            var candidates = new Dictionary<IntPtr, Vector3>();
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+                throw new InvalidOperationException("Could not open SnowRunner for memory scanning.");
+
+            try
+            {
+                IntPtr address = IntPtr.Zero;
+                int informationSize = Marshal.SizeOf(typeof(MemoryBasicInformation));
+                while (VirtualQueryEx(processHandle, address, out MemoryBasicInformation region, (uint)informationSize) != 0)
+                {
+                    long regionBase = region.BaseAddress.ToInt64();
+                    long regionSize = region.RegionSize.ToInt64();
+                    if (regionSize <= 0)
+                        break;
+
+                    if (region.State == MemoryCommit && IsReadable(region.Protect))
+                    {
+                        ScanRegion(processHandle, regionBase, regionSize, center, radius, candidates);
+                    }
+
+                    long nextAddress = regionBase + regionSize;
+                    if (nextAddress <= regionBase)
+                        break;
+                    address = new IntPtr(nextAddress);
+                }
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
+
+            return candidates;
+        }
+
+        private static void ScanRegion(IntPtr processHandle, long regionBase, long regionSize, Vector3 center, float radius, Dictionary<IntPtr, Vector3> candidates)
+        {
+            float radiusSquared = radius * radius;
+            for (long offset = 0; offset < regionSize; offset += CameraScanChunkSize)
+            {
+                int bytesToRead = (int)Math.Min(CameraScanChunkSize, regionSize - offset);
+                byte[] buffer = new byte[bytesToRead];
+                if (!ReadProcessMemory(processHandle, new IntPtr(regionBase + offset), buffer, bytesToRead, out IntPtr bytesRead))
+                    continue;
+
+                int available = Math.Min(bytesToRead, bytesRead.ToInt32());
+                for (int index = 0; index + 12 <= available; index += 4)
+                {
+                    Vector3 value = new Vector3(
+                        BitConverter.ToSingle(buffer, index),
+                        BitConverter.ToSingle(buffer, index + 4),
+                        BitConverter.ToSingle(buffer, index + 8));
+                    if (IsFiniteVector(value) && Vector3.DistanceSquared(value, center) <= radiusSquared)
+                    {
+                        candidates[new IntPtr(regionBase + offset + index)] = value;
+                    }
+                }
+            }
+        }
+
+        private static List<CameraCandidate> FindChangedCameraVectors(Process snowRunnerProcess, Dictionary<IntPtr, Vector3> baseline)
+        {
+            var changed = new List<CameraCandidate>();
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+                throw new InvalidOperationException("Could not open SnowRunner for the second camera scan.");
+
+            try
+            {
+                foreach (var entry in baseline)
+                {
+                    byte[] buffer = new byte[12];
+                    if (!ReadProcessMemory(processHandle, entry.Key, buffer, buffer.Length, out IntPtr bytesRead) || bytesRead.ToInt32() != buffer.Length)
+                        continue;
+
+                    Vector3 current = new Vector3(
+                        BitConverter.ToSingle(buffer, 0),
+                        BitConverter.ToSingle(buffer, 4),
+                        BitConverter.ToSingle(buffer, 8));
+                    if (!IsFiniteVector(current))
+                        continue;
+
+                    float distance = Vector3.Distance(entry.Value, current);
+                    if (distance >= 1.0f)
+                    {
+                        changed.Add(new CameraCandidate
+                        {
+                            Address = entry.Key,
+                            Before = entry.Value,
+                            After = current,
+                            Distance = distance
+                        });
+                    }
+                }
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
+
+            changed.Sort((left, right) => right.Distance.CompareTo(left.Distance));
+            return changed;
+        }
+
+        private static bool IsReadable(uint protection)
+        {
+            if ((protection & PageGuard) != 0 || (protection & PageNoAccess) != 0)
+                return false;
+            return (protection & 0xFF) != 0;
+        }
+
+        private static bool IsFiniteVector(Vector3 value)
+        {
+            return !float.IsNaN(value.X) && !float.IsInfinity(value.X) &&
+                   !float.IsNaN(value.Y) && !float.IsInfinity(value.Y) &&
+                   !float.IsNaN(value.Z) && !float.IsInfinity(value.Z);
         }
 
         public static IntPtr ReadOffsetFromOpcode(IMemory memory, IntPtr opcodeBegin, int offsetUntilAddress)
@@ -512,6 +751,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.ToggleTimeLapseMode +": \t Toggle timelapse\n");
             Console.WriteLine("Ctrl + "+ config.GetPlayerLocation +": \t Get player location\n");
             Console.WriteLine("Ctrl + "+ config.TogglePlayerTracking +": \t Toggle continuous player tracking\n");
+            Console.WriteLine("Ctrl + "+ config.CaptureCameraScan +": \t Capture/compare freecam vectors\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -576,6 +816,10 @@ namespace SnowFlyer2
             else if (e2.Key == config.TogglePlayerTracking)
             {
                 TogglePlayerCoordTracking(snowRunnerProcess);
+            }
+            else if (e2.Key == config.CaptureCameraScan)
+            {
+                CaptureCameraScan(snowRunnerProcess);
             }
             else
             {

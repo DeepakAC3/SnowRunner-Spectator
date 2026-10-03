@@ -27,5 +27,8 @@ namespace SnowFlyer2
 
         [JsonConverter(typeof(HexConverter))]
         public Keys TogglePlayerTracking { get; set; }
+
+        [JsonConverter(typeof(HexConverter))]
+        public Keys CaptureCameraScan { get; set; }
     }
 }

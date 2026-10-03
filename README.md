@@ -19,6 +19,7 @@ This branch adds a first reverse-engineering aid for the spectator project:
 
 - `Ctrl+F4` prints the local player position once.
 - `Ctrl+F5` starts or stops continuous local position tracking.
+- `Ctrl+F6` captures or compares freecam vector candidates near the truck.
 
 Use the tracker in single-player first. It should print lines in this form while
 you drive:
@@ -26,3 +27,7 @@ you drive:
 ```text
 LOCAL: X Y Z
 ```
+
+For the camera scan, press `Ctrl+F6`, move the free camera, then press
+`Ctrl+F6` again. The tool will print the addresses whose three-float values
+changed between the two captures.
