@@ -341,16 +341,29 @@ namespace SnowFlyer2
                 }
 
                 Console.WriteLine($"Changed camera candidates: {changedCandidates.Count}");
+                var elevatedChanges = changedCandidates
+                    .Where(candidate =>
+                        Math.Abs(candidate.Before.Y - CameraScanCenter.Y) <= 20.0f &&
+                        Math.Abs(candidate.After.Y - CameraScanCenter.Y) <= 20.0f &&
+                        (Vector3.DistanceSquared(candidate.Before, CameraScanCenter) > 4.0f ||
+                         Vector3.DistanceSquared(candidate.After, CameraScanCenter) > 4.0f))
+                    .OrderByDescending(candidate => candidate.Distance)
+                    .Take(20)
+                    .ToList();
                 var smallChanges = changedCandidates
                     .Where(candidate => candidate.Distance <= 25.0f)
                     .OrderBy(candidate => candidate.Distance)
                     .Take(20)
                     .ToList();
-                var results = smallChanges.Count > 0
+                var results = elevatedChanges.Count > 0
+                    ? elevatedChanges
+                    : smallChanges.Count > 0
                     ? smallChanges
                     : changedCandidates.Take(20).ToList();
 
-                if (smallChanges.Count > 0)
+                if (elevatedChanges.Count > 0)
+                    Console.WriteLine("Camera-height movement candidates:");
+                else if (smallChanges.Count > 0)
                     Console.WriteLine("Small movement candidates:");
 
                 foreach (var candidate in results)
