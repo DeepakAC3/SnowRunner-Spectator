@@ -96,6 +96,8 @@ namespace SnowFlyer2
         private static Vector3 CameraFollowOffset;
         private static bool HasCameraNudge = false;
         private static Vector3 CameraNudgeOriginalPosition;
+        private static byte[] PreviousCameraSnapshot;
+        private static long PreviousCameraSnapshotBase;
         private static bool HasCameraScanBaseline = false;
         private static Dictionary<IntPtr, Vector3> CameraScanBaseline;
         private static Vector3 CameraScanCenter;
@@ -690,6 +692,34 @@ namespace SnowFlyer2
                     $"{ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraRotationOffsetB)}, " +
                     $"+0x{KnownCameraRotationOffsetC:X3} " +
                     $"{ReadSnapshotVector3(snapshot, snapshotStart, KnownCameraRotationOffsetC)}");
+                if (PreviousCameraSnapshot != null && PreviousCameraSnapshotBase == cameraBase)
+                {
+                    var changedFields = new List<Tuple<int, float>>();
+                    for (int offset = snapshotStart; offset <= snapshotStart + snapshotSize - 4; offset += 4)
+                    {
+                        int snapshotOffset = offset - snapshotStart;
+                        float previous = BitConverter.ToSingle(PreviousCameraSnapshot, snapshotOffset);
+                        float current = BitConverter.ToSingle(snapshot, snapshotOffset);
+                        if (IsFiniteFloat(previous) && IsFiniteFloat(current) &&
+                            Math.Abs(current - previous) >= 0.01f)
+                        {
+                            changedFields.Add(Tuple.Create(offset, Math.Abs(current - previous)));
+                        }
+                    }
+
+                    Console.WriteLine($"Changed scalar fields since last snapshot: {changedFields.Count}");
+                    foreach (var changedField in changedFields.OrderByDescending(field => field.Item2).Take(40))
+                    {
+                        int offset = changedField.Item1;
+                        int snapshotOffset = offset - snapshotStart;
+                        float previous = BitConverter.ToSingle(PreviousCameraSnapshot, snapshotOffset);
+                        float current = BitConverter.ToSingle(snapshot, snapshotOffset);
+                        Console.WriteLine($"  +0x{offset:X3}: {previous:F4} -> {current:F4}");
+                    }
+                }
+
+                PreviousCameraSnapshot = snapshot;
+                PreviousCameraSnapshotBase = cameraBase;
                 Console.WriteLine("Nearby normalized vectors from one read:");
                 for (int offset = 0x100; offset <= 0x280; offset += 4)
                 {
@@ -1398,6 +1428,11 @@ namespace SnowFlyer2
             return !float.IsNaN(value.X) && !float.IsInfinity(value.X) &&
                    !float.IsNaN(value.Y) && !float.IsInfinity(value.Y) &&
                    !float.IsNaN(value.Z) && !float.IsInfinity(value.Z);
+        }
+
+        private static bool IsFiniteFloat(float value)
+        {
+            return !float.IsNaN(value) && !float.IsInfinity(value);
         }
 
         private static bool IsNearCameraSearchArea(Vector3 value, Vector3 center, float radius, float radiusSquared)
