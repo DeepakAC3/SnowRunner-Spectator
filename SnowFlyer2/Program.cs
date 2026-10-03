@@ -106,6 +106,7 @@ namespace SnowFlyer2
         private const int CameraScanVerticalRadius = 100;
         private const int CameraScanChunkSize = 1024 * 1024;
         private const int PointerSearchRange = 0x400;
+        private const int CameraCandidateRetentionCount = 100;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
@@ -363,16 +364,20 @@ namespace SnowFlyer2
                     ? elevatedChanges
                     : smallChanges.Count > 0
                     ? smallChanges
-                    : changedCandidates.Take(20).ToList();
+                    : changedCandidates.Take(CameraCandidateRetentionCount).ToList();
 
-                LastCameraCandidateAddresses = results.Select(candidate => candidate.Address).ToList();
+                LastCameraCandidateAddresses = LastCameraCandidateAddresses
+                    .Concat(results.Select(candidate => candidate.Address))
+                    .Distinct()
+                    .Take(CameraCandidateRetentionCount * 2)
+                    .ToList();
 
                 if (elevatedChanges.Count > 0)
                     Console.WriteLine("Camera-height movement candidates:");
                 else if (smallChanges.Count > 0)
                     Console.WriteLine("Small movement candidates:");
 
-                foreach (var candidate in results)
+                foreach (var candidate in results.Take(20))
                 {
                     Console.WriteLine($"0x{candidate.Address.ToInt64():X}: " +
                         $"{candidate.Before.X:F2},{candidate.Before.Y:F2},{candidate.Before.Z:F2} -> " +
