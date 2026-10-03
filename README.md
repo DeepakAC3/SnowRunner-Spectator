@@ -22,6 +22,8 @@ This branch adds a first reverse-engineering aid for the spectator project:
 - `Ctrl+F6` performs the initial freecam vector scan, then narrows the same
   candidate set after each camera movement.
 - `Ctrl+F7` searches pointer references after the candidate set is narrow.
+- `Ctrl+F8` resets the camera scan when a movement sequence selects unrelated
+  vectors.
 
 Use the tracker in single-player first. It should print lines in this form while
 you drive:

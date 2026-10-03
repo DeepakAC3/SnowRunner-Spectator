@@ -155,6 +155,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.TogglePlayerTracking, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.CaptureCameraScan, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.FindCameraPointers, KeyModifiers.Control);
+            HotKeyManager.RegisterHotKey(config.ResetCameraScan, KeyModifiers.Control);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -402,6 +403,17 @@ namespace SnowFlyer2
                 ActiveCameraPointerChain = null;
                 Console.WriteLine($"Camera scan failed: {ex.Message}");
             }
+        }
+
+        private static void ResetCameraScan()
+        {
+            HasCameraScanBaseline = false;
+            CameraScanBaseline = null;
+            CameraScanCenter = default;
+            LastCameraCandidateAddresses.Clear();
+            LastPointerReferenceAddresses.Clear();
+            ActiveCameraPointerChain = null;
+            Console.WriteLine("Camera scan reset. Press Ctrl+F6 for a new initial scan.");
         }
 
         private static bool TryReadPlayerCoords(Process snowRunnerProcess, out Vector3 playerVector)
@@ -1170,6 +1182,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.TogglePlayerTracking +": \t Toggle continuous player tracking\n");
             Console.WriteLine("Ctrl + "+ config.CaptureCameraScan +": \t Capture/compare freecam vectors\n");
             Console.WriteLine("Ctrl + "+ config.FindCameraPointers +": \t Find module references to camera candidates\n");
+            Console.WriteLine("Ctrl + "+ config.ResetCameraScan +": \t Reset camera scan candidates\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -1242,6 +1255,10 @@ namespace SnowFlyer2
             else if (e2.Key == config.FindCameraPointers)
             {
                 FindCameraPointerReferences(snowRunnerProcess);
+            }
+            else if (e2.Key == config.ResetCameraScan)
+            {
+                ResetCameraScan();
             }
             else
             {

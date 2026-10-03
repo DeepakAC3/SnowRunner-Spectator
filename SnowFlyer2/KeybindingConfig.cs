@@ -33,5 +33,8 @@ namespace SnowFlyer2
 
         [JsonConverter(typeof(HexConverter))]
         public Keys FindCameraPointers { get; set; }
+
+        [JsonConverter(typeof(HexConverter))]
+        public Keys ResetCameraScan { get; set; }
     }
 }
