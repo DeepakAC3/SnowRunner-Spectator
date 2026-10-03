@@ -94,6 +94,7 @@ namespace SnowFlyer2
         private static bool HasCameraScanBaseline = false;
         private static Dictionary<IntPtr, Vector3> CameraScanBaseline;
         private static Vector3 CameraScanCenter;
+        private static List<IntPtr> LastCameraCandidateAddresses = new List<IntPtr>();
 
         private const uint ProcessQueryInformation = 0x0400;
         private const uint ProcessVmRead = 0x0010;
@@ -103,6 +104,7 @@ namespace SnowFlyer2
         private const int CameraScanRadius = 300;
         private const int CameraScanVerticalRadius = 100;
         private const int CameraScanChunkSize = 1024 * 1024;
+        private const int PointerSearchRange = 0x400;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
@@ -149,6 +151,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.GetPlayerLocation, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.TogglePlayerTracking, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.CaptureCameraScan, KeyModifiers.Control);
+            HotKeyManager.RegisterHotKey(config.FindCameraPointers, KeyModifiers.Control);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -361,6 +364,8 @@ namespace SnowFlyer2
                     ? smallChanges
                     : changedCandidates.Take(20).ToList();
 
+                LastCameraCandidateAddresses = results.Select(candidate => candidate.Address).ToList();
+
                 if (elevatedChanges.Count > 0)
                     Console.WriteLine("Camera-height movement candidates:");
                 else if (smallChanges.Count > 0)
@@ -512,6 +517,133 @@ namespace SnowFlyer2
 
             changed.Sort((left, right) => right.Distance.CompareTo(left.Distance));
             return changed;
+        }
+
+        private struct PointerTarget
+        {
+            public IntPtr Candidate;
+            public int Delta;
+        }
+
+        private static void FindCameraPointerReferences(Process snowRunnerProcess)
+        {
+            if (LastCameraCandidateAddresses.Count == 0)
+            {
+                Console.WriteLine("No camera candidates are available. Run the two-step Ctrl+F6 scan first.");
+                return;
+            }
+
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead, false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+                throw new InvalidOperationException("Could not open SnowRunner for pointer scanning.");
+
+            try
+            {
+                var targets = new Dictionary<long, List<PointerTarget>>();
+                foreach (IntPtr candidate in LastCameraCandidateAddresses)
+                {
+                    long candidateAddress = candidate.ToInt64();
+                    for (int delta = 0; delta <= PointerSearchRange; delta += 4)
+                    {
+                        long objectAddress = candidateAddress - delta;
+                        if (!targets.TryGetValue(objectAddress, out List<PointerTarget> matches))
+                        {
+                            matches = new List<PointerTarget>();
+                            targets.Add(objectAddress, matches);
+                        }
+                        matches.Add(new PointerTarget { Candidate = candidate, Delta = delta });
+                    }
+                }
+
+                long moduleStart = snowRunnerProcess.MainModule.BaseAddress.ToInt64();
+                long moduleEnd = moduleStart + snowRunnerProcess.MainModule.ModuleMemorySize;
+                var references = ScanModuleForPointerReferences(processHandle, moduleStart, moduleEnd, targets);
+
+                if (references.Count == 0)
+                {
+                    Console.WriteLine("No direct module references found within the first 0x400 bytes before the candidates.");
+                    return;
+                }
+
+                Console.WriteLine($"Module pointer references: {references.Count}");
+                foreach (var reference in references.Take(50))
+                {
+                    Console.WriteLine($"SnowRunner.exe+0x{reference.ReferenceOffset:X} -> " +
+                        $"candidate 0x{reference.Candidate.ToInt64():X} + 0x{reference.Delta:X}");
+                }
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
+        }
+
+        private struct PointerReference
+        {
+            public long ReferenceOffset;
+            public IntPtr Candidate;
+            public int Delta;
+        }
+
+        private static List<PointerReference> ScanModuleForPointerReferences(
+            IntPtr processHandle,
+            long moduleStart,
+            long moduleEnd,
+            Dictionary<long, List<PointerTarget>> targets)
+        {
+            var references = new List<PointerReference>();
+            IntPtr address = new IntPtr(moduleStart);
+            int informationSize = Marshal.SizeOf(typeof(MemoryBasicInformation));
+
+            while (VirtualQueryEx(processHandle, address, out MemoryBasicInformation region, (uint)informationSize) != 0)
+            {
+                long regionBase = region.BaseAddress.ToInt64();
+                long regionSize = region.RegionSize.ToInt64();
+                if (regionSize <= 0)
+                    break;
+
+                long regionEnd = regionBase + regionSize;
+                if (regionBase >= moduleEnd)
+                    break;
+
+                if (region.State == MemoryCommit && IsReadable(region.Protect))
+                {
+                    long readStart = Math.Max(regionBase, moduleStart);
+                    long readEnd = Math.Min(regionEnd, moduleEnd);
+                    for (long offset = readStart; offset < readEnd; offset += CameraScanChunkSize)
+                    {
+                        int bytesToRead = (int)Math.Min(CameraScanChunkSize, readEnd - offset);
+                        byte[] buffer = new byte[bytesToRead];
+                        if (!ReadProcessMemory(processHandle, new IntPtr(offset), buffer, bytesToRead, out IntPtr bytesRead))
+                            continue;
+
+                        int available = Math.Min(bytesToRead, bytesRead.ToInt32());
+                        for (int index = 0; index + 8 <= available; index += 8)
+                        {
+                            long value = BitConverter.ToInt64(buffer, index);
+                            if (!targets.TryGetValue(value, out List<PointerTarget> matches))
+                                continue;
+
+                            foreach (PointerTarget match in matches)
+                            {
+                                references.Add(new PointerReference
+                                {
+                                    ReferenceOffset = offset + index - moduleStart,
+                                    Candidate = match.Candidate,
+                                    Delta = match.Delta
+                                });
+                            }
+                        }
+                    }
+                }
+
+                long nextAddress = regionBase + regionSize;
+                if (nextAddress <= regionBase)
+                    break;
+                address = new IntPtr(nextAddress);
+            }
+
+            return references;
         }
 
         private static bool IsReadable(uint protection)
@@ -786,6 +918,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.GetPlayerLocation +": \t Get player location\n");
             Console.WriteLine("Ctrl + "+ config.TogglePlayerTracking +": \t Toggle continuous player tracking\n");
             Console.WriteLine("Ctrl + "+ config.CaptureCameraScan +": \t Capture/compare freecam vectors\n");
+            Console.WriteLine("Ctrl + "+ config.FindCameraPointers +": \t Find module references to camera candidates\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -854,6 +987,10 @@ namespace SnowFlyer2
             else if (e2.Key == config.CaptureCameraScan)
             {
                 CaptureCameraScan(snowRunnerProcess);
+            }
+            else if (e2.Key == config.FindCameraPointers)
+            {
+                FindCameraPointerReferences(snowRunnerProcess);
             }
             else
             {

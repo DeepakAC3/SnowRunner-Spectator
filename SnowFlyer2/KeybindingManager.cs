@@ -30,12 +30,15 @@ namespace SnowFlyer2
                 if (config.CaptureCameraScan == Keys.None)
                     config.CaptureCameraScan = Keys.F6;
 
+                if (config.FindCameraPointers == Keys.None)
+                    config.FindCameraPointers = Keys.F7;
+
                 return config;
             }
             else
             {
                 // Default keybinding if the file doesn't exist
-                KeybindingConfig defaultBinds = new KeybindingConfig { Instructions= "The keybinds are hex key modifiers - see microsoft docs for a full list. https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes", ToggleFlyMode = Keys.F1, ToggleFreezeTime=Keys.F2, ToggleTimeLapseMode=Keys.F3, GetPlayerLocation=Keys.F4, TogglePlayerTracking=Keys.F5, CaptureCameraScan=Keys.F6};
+                KeybindingConfig defaultBinds = new KeybindingConfig { Instructions= "The keybinds are hex key modifiers - see microsoft docs for a full list. https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes", ToggleFlyMode = Keys.F1, ToggleFreezeTime=Keys.F2, ToggleTimeLapseMode=Keys.F3, GetPlayerLocation=Keys.F4, TogglePlayerTracking=Keys.F5, CaptureCameraScan=Keys.F6, FindCameraPointers=Keys.F7};
                 SaveKeybindingConfig(defaultBinds);
                 return defaultBinds;
             }
