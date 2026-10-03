@@ -526,6 +526,12 @@ namespace SnowFlyer2
                 return;
             }
 
+            if (!EnableExperimentalCameraWrites)
+            {
+                Console.WriteLine("Camera position writes are disabled until the writable camera state is identified.");
+                return;
+            }
+
             IntPtr processHandle = OpenProcess(
                 ProcessQueryInformation | ProcessVmRead | ProcessVmWrite | ProcessVmOperation,
                 false,
