@@ -146,8 +146,9 @@ When `Face truck` is enabled, follow validates and writes the complete 64-byte
 source matrix as one guarded update. It requires exact or bounded coherent
 readback and cache invalidation. Tiny game-side basis recomposition is accepted
 only when the coherent translation residual and reconstructed position remain
-within the validated 0.1 m bound; any other failure attempts a byte-exact
-matrix rollback and stops follow. Default follow leaves the native camera
+within the validated 0.1 m bound. Larger coherent rotation races attempt a
+byte-exact rollback and bounded retry; invalid readbacks or unverified rollbacks
+stop follow. Default follow leaves the native camera
 basis untouched.
 
 ## Runtime evidence (2026-10-04)
@@ -197,12 +198,15 @@ A later Face truck + Orbit drive stopped after a coherent rotation readback
 race: basis delta 0.0021316, reconstructed position delta 0.0002 m. Release15
 keeps the strict success tolerance and retries bounded coherent rotations only
 after byte-exact rollback and cache invalidation readback succeed. Seven pure
-matrix regression checks passed. The repeat in-game Face truck + Orbit drive
+matrix regression checks passed. The repeat in-game drive, with Face truck and
+Orbit toggled during the run,
 recorded 192 samples over 202 seconds and approximately 922 m of truck travel.
-Two coherent rotation readback races occurred, and follow continued after each
+Two coherent rotation readback races occurred with Face truck and Orbit enabled,
+and follow continued after each
 with no logged fatal stop or rollback failure. Maximum sampled source-to-target
-position error was 0.131 m. The corrected menu loaded after a game restart;
-switching its pending truck choice is no longer overwritten each frame.
+position error was 0.131 m. The corrected menu loaded after a game restart.
+The pending truck selection fix passed source review; a live switch to a
+different truck after attachment remains to be checked.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
