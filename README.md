@@ -158,9 +158,12 @@ basis untouched.
 
 The latest control revision removes the Orbit toggle and adds held right-mouse
 drag and XInput right-stick gestures directly to follow. The helper and native
-menu build successfully and passed source review. These gestures still require
-in-game verification after restarting SnowRunner; no controller was connected
-during preparation. With Face truck off, right-stick input also reaches the
+menu build successfully and passed source review. After restarting SnowRunner,
+the updated menu loaded and listed three trucks.
+The user verified that held right-mouse drag moves around the truck and follow
+continues after release. Physical controller verification remains pending; no
+controller was connected during preparation. With Face truck off, right-stick
+input also reaches the
 game's native camera rotation.
 
 Release4 found the same three distinct truck chassis and visually attached to
