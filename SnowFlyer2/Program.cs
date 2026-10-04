@@ -831,7 +831,7 @@ namespace SnowFlyer2
                         $"{CameraFollowOffset.Y:F2} {CameraFollowOffset.Z:F2}.");
                     Task.Run(() => TrackCameraFollow(snowRunnerProcess, owner,
                         target.Action, target.ChassisBody, target.Frame,
-                        target.AssetId,
+                        target.AssetId, target.ActionVtable, target.ChassisVtable, activeOwner,
                         snowRunnerProcess.MainModule.BaseAddress, source.Transform, generation));
                 }
             }
@@ -1188,7 +1188,8 @@ namespace SnowFlyer2
                     int generation = ++CameraFollowGeneration;
                     Task.Run(() => TrackCameraFollow(snowRunnerProcess,
                         target.Owner, target.Action, target.ChassisBody, target.Frame,
-                        target.AssetId, moduleBase, source.Transform, generation));
+                        target.AssetId, target.ActionVtable, target.ChassisVtable, activeOwner,
+                        moduleBase, source.Transform, generation));
                     return $"Attached to {target.AssetId}; follow is active.";
                 }
             }
@@ -1757,7 +1758,8 @@ namespace SnowFlyer2
 
         private static void TrackCameraFollow(Process snowRunnerProcess,
             IntPtr targetOwner, IntPtr expectedAction, IntPtr expectedBody,
-            IntPtr expectedFrame, string expectedAssetId, IntPtr moduleBase,
+            IntPtr expectedFrame, string expectedAssetId, IntPtr actionVtable,
+            IntPtr chassisVtable, IntPtr attachmentActiveOwner, IntPtr moduleBase,
             IntPtr expectedTransform, int generation)
         {
             IntPtr processHandle = OpenProcess(
@@ -1773,6 +1775,13 @@ namespace SnowFlyer2
             bool timerResolutionActive = false;
             try
             {
+                // These tables came from the fully validated selected snapshot
+                // at attach/start. Each tick still compares live target tables
+                // and all reciprocal identity links; unrelated active-player
+                // streaming must not prevent reading this selected owner.
+                Console.WriteLine($"Follow identity validation: selected owner {targetOwner.ToInt64():X}, " +
+                    $"action vtable {actionVtable.ToInt64():X}, chassis vtable {chassisVtable.ToInt64():X}; " +
+                    "tables validated at attachment, active-owner metadata sampled at attachment.");
                 timerResolutionActive = TimeBeginPeriod(1) == 0;
                 Vector3 previousPlayer = default;
                 bool hasPreviousPlayer = false;
@@ -1802,15 +1811,8 @@ namespace SnowFlyer2
                         bool transientFailure = false;
                         bool skipTick = false;
                         string transientReason = null;
-                        if (!TryReadTruckScanIdentity(processHandle, moduleBase,
-                                out IntPtr activeOwner, out IntPtr actionVtable,
-                                out IntPtr chassisVtable))
-                        {
-                            transientFailure = true;
-                            transientReason = "Truck identity read was temporarily unavailable.";
-                        }
-                        else if (!TryReadValidatedTruckOwner(processHandle, targetOwner,
-                                actionVtable, chassisVtable, activeOwner,
+                        if (!TryReadValidatedTruckOwner(processHandle, targetOwner,
+                                actionVtable, chassisVtable, attachmentActiveOwner,
                                 out target))
                         {
                             transientFailure = true;
@@ -1841,7 +1843,7 @@ namespace SnowFlyer2
                             // game's physics update. Confirm a large jump before
                             // treating it as a real teleport or identity fault.
                             if (TryReadValidatedTruckOwner(processHandle, targetOwner,
-                                    actionVtable, chassisVtable, activeOwner,
+                                    actionVtable, chassisVtable, attachmentActiveOwner,
                                     out TruckTargetSnapshot retryTarget) &&
                                 retryTarget.Action == expectedAction &&
                                 retryTarget.ChassisBody == expectedBody &&

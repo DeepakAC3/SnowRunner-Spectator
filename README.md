@@ -220,8 +220,12 @@ Two coherent rotation readback races occurred with Face truck and Orbit enabled,
 and follow continued after each
 with no logged fatal stop or rollback failure. Maximum sampled source-to-target
 position error was 0.131 m. The corrected menu loaded after a game restart.
-The pending truck selection fix passed source review; a live switch to a
-different truck after attachment remains to be checked.
+The user verified switching from CK1500 to Fleetstar through the menu, and
+the log confirms follow selected the Fleetstar owner. A later stop at 15:08:50
+was caused by the unrelated active-player identity chain becoming unavailable.
+The follow worker now retains validated type tables from attachment and checks
+the selected truck directly on each tick. Selected-truck identity and camera
+write guards remain mandatory. Live verification of this latest fix is pending.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each

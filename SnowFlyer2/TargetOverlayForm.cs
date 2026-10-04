@@ -134,7 +134,7 @@ namespace SnowFlyer2
             };
             Label orbitInstructions = new Label
             {
-                Text = "While following: hold right mouse and drag, or use the controller right stick, to move around the truck.",
+                Text = "Follow controls (in-game menu connected and closed): RMB drag / controller right stick.",
                 AutoSize = false,
                 Width = 340,
                 Height = 30,
