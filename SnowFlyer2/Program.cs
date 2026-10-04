@@ -115,7 +115,29 @@ namespace SnowFlyer2
         private static float CameraOrbitRadius;
         private static bool CameraOrbitHasState;
         private static volatile bool FaceTruckEnabled;
-        private static volatile bool OrbitModeEnabled;
+        private static float CameraOrbitPendingMouseX;
+        private static float CameraOrbitPendingMouseY;
+        private static bool CameraOrbitXInputUnavailable;
+        private static bool SpectatorNativeMenuVisible;
+        private static long SpectatorNativeInputTimestamp;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CameraGamepad
+        {
+            public ushort Buttons;
+            public byte LeftTrigger, RightTrigger;
+            public short LeftX, LeftY, RightX, RightY;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CameraGamepadState
+        {
+            public uint Packet;
+            public CameraGamepad Gamepad;
+        }
+
+        [DllImport("xinput1_4.dll", EntryPoint = "XInputGetState")]
+        private static extern uint CameraXInputGetState(uint index, out CameraGamepadState state);
         private static DateTime LastMatrixReadbackAdjustmentLog = DateTime.MinValue;
         // Follow diagnostics are kept independently from the worker's lifetime so
         // the overlay (or another UI surface) can explain a stalled follow after
@@ -237,10 +259,12 @@ namespace SnowFlyer2
         private const float CameraFollowTranslationBasisGuardTolerance = 0.02f;
         private const float CameraFollowTranslationPositionGuardTolerance = 0.20f;
         private const float CameraSourceReadbackBasisTolerance = 0.00005f;
-        private const float CameraSourceReadbackBasisRaceRetryLimit = 0.01f;
         private const float CameraSourceReadbackTranslationResidualTolerance = CameraSourcePositionTolerance;
         private const float CameraSourceReadbackPositionTolerance = CameraSourcePositionTolerance;
         private const float CameraOrbitAngularSpeed = 1.8f;
+        private const float CameraOrbitMouseRadiansPerPixel = 0.003f;
+        private const float CameraOrbitMaximumMouseDelta = 512.0f;
+        private const float CameraOrbitStickDeadzone = 8689.0f / 32767.0f;
         private const float CameraOrbitMaxElevation = 1.3962634f; // 80 degrees
         private const int CameraSourceStableReadAttempts = 3;
         private const int CameraSourceStableReadDelayMilliseconds = 2;
@@ -837,7 +861,7 @@ namespace SnowFlyer2
                     CameraFollowDiagnosticTargetPosition,
                     CameraFollowDiagnosticOffset,
                     FaceTruckEnabled,
-                    OrbitModeEnabled);
+                    IsFollowingPlayer);
             }
         }
 
@@ -965,9 +989,7 @@ namespace SnowFlyer2
                 SelectFollowTarget,
                 () => AttachSelectedTruck(snowRunnerProcess),
                 value => SetFaceTruckEnabled(value),
-                value => SetOrbitModeEnabled(value),
                 () => FaceTruckEnabled,
-                () => OrbitModeEnabled,
                 snowRunnerProcess.MainWindowHandle,
                 () => GetCameraFollowStatus());
             TargetOverlay.FormClosed += (sender, args) => TargetOverlay = null;
@@ -986,19 +1008,21 @@ namespace SnowFlyer2
                 : "Face truck disabled; follow preserves native camera rotation.");
         }
 
-        private static void SetOrbitModeEnabled(bool enabled)
+        private static void QueueCameraOrbitMouse(Process game, float x, float y)
         {
+            if (!IsFiniteFloat(x) || !IsFiniteFloat(y) ||
+                Math.Abs(x) > CameraOrbitMaximumMouseDelta ||
+                Math.Abs(y) > CameraOrbitMaximumMouseDelta || !IsSnowRunnerForeground(game))
+                return;
             lock (CameraWriteGate)
             {
-                OrbitModeEnabled = enabled;
-                if (enabled)
-                    InitializeCameraOrbitLocked();
-                else
-                    CameraOrbitHasState = false;
+                if (!IsFollowingPlayer || SpectatorNativeMenuVisible)
+                    return;
+                CameraOrbitPendingMouseX = Math.Max(-CameraOrbitMaximumMouseDelta,
+                    Math.Min(CameraOrbitMaximumMouseDelta, CameraOrbitPendingMouseX + x));
+                CameraOrbitPendingMouseY = Math.Max(-CameraOrbitMaximumMouseDelta,
+                    Math.Min(CameraOrbitMaximumMouseDelta, CameraOrbitPendingMouseY + y));
             }
-            Console.WriteLine(enabled
-                ? "Orbit mode enabled. Hold arrow keys while SnowRunner is focused."
-                : "Orbit mode disabled.");
         }
 
         private static void ResetCameraFollowSmoothingLocked(Vector3 initialPosition)
@@ -1016,6 +1040,8 @@ namespace SnowFlyer2
             CameraOrbitElevation = 0.0f;
             CameraOrbitRadius = 0.0f;
             CameraOrbitHasState = false;
+            CameraOrbitPendingMouseX = 0;
+            CameraOrbitPendingMouseY = 0;
         }
 
         private static void InitializeCameraOrbitLocked()
@@ -1868,8 +1894,7 @@ namespace SnowFlyer2
                                     // not pull the camera back toward its old state.
                                     CameraFollowSmoothedPosition = source.WorldPosition;
                                     CameraFollowHasSmoothedPosition = true;
-                                    if (OrbitModeEnabled)
-                                        InitializeCameraOrbitLocked();
+                                    InitializeCameraOrbitLocked();
                                 }
                             }
 
@@ -2029,28 +2054,27 @@ namespace SnowFlyer2
         private static void UpdateCameraOrbitLocked(Process snowRunnerProcess,
             float deltaSeconds)
         {
-            if (!OrbitModeEnabled)
-                return;
+            float mouseX = CameraOrbitPendingMouseX;
+            float mouseY = CameraOrbitPendingMouseY;
+            CameraOrbitPendingMouseX = 0;
+            CameraOrbitPendingMouseY = 0;
             if (!CameraOrbitHasState)
                 InitializeCameraOrbitLocked();
-            if (!CameraOrbitHasState || !IsSnowRunnerForeground(snowRunnerProcess))
+            if (!CameraOrbitHasState || !IsSnowRunnerForeground(snowRunnerProcess) ||
+                SpectatorNativeMenuVisible ||
+                DateTime.UtcNow.Ticks - SpectatorNativeInputTimestamp > TimeSpan.TicksPerSecond)
                 return;
 
-            float azimuthDelta = 0.0f;
-            float elevationDelta = 0.0f;
-            if (IsVirtualKeyHeld(VirtualKeyLeft))
-                azimuthDelta -= 1.0f;
-            if (IsVirtualKeyHeld(VirtualKeyRight))
-                azimuthDelta += 1.0f;
-            if (IsVirtualKeyHeld(VirtualKeyUp))
-                elevationDelta += 1.0f;
-            if (IsVirtualKeyHeld(VirtualKeyDown))
-                elevationDelta -= 1.0f;
-
-            CameraOrbitAzimuth += azimuthDelta * CameraOrbitAngularSpeed * deltaSeconds;
+            Vector2 stick = ReadCameraOrbitStick();
+            float azimuthDelta = mouseX * CameraOrbitMouseRadiansPerPixel +
+                stick.X * CameraOrbitAngularSpeed * deltaSeconds;
+            float elevationDelta = -mouseY * CameraOrbitMouseRadiansPerPixel +
+                stick.Y * CameraOrbitAngularSpeed * deltaSeconds;
+            CameraOrbitAzimuth = (CameraOrbitAzimuth + azimuthDelta) %
+                (2.0f * (float)Math.PI);
             CameraOrbitElevation = Math.Max(-CameraOrbitMaxElevation,
                 Math.Min(CameraOrbitMaxElevation,
-                    CameraOrbitElevation + elevationDelta * CameraOrbitAngularSpeed * deltaSeconds));
+                    CameraOrbitElevation + elevationDelta));
             if (azimuthDelta == 0.0f && elevationDelta == 0.0f)
                 return;
 
@@ -2059,6 +2083,30 @@ namespace SnowFlyer2
                 (float)Math.Sin(CameraOrbitAzimuth) * cosElevation * CameraOrbitRadius,
                 (float)Math.Sin(CameraOrbitElevation) * CameraOrbitRadius,
                 (float)Math.Cos(CameraOrbitAzimuth) * cosElevation * CameraOrbitRadius);
+        }
+
+        private static Vector2 ReadCameraOrbitStick()
+        {
+            if (CameraOrbitXInputUnavailable)
+                return Vector2.Zero;
+            try
+            {
+                for (uint index = 0; index < 4; index++)
+                {
+                    if (CameraXInputGetState(index, out CameraGamepadState state) != 0)
+                        continue;
+                    Vector2 stick = new Vector2(state.Gamepad.RightX / 32767.0f,
+                        state.Gamepad.RightY / 32767.0f);
+                    float length = stick.Length();
+                    if (length <= CameraOrbitStickDeadzone)
+                        continue;
+                    return stick / length * Math.Min(1.0f,
+                        (length - CameraOrbitStickDeadzone) / (1.0f - CameraOrbitStickDeadzone));
+                }
+            }
+            catch (DllNotFoundException) { CameraOrbitXInputUnavailable = true; }
+            catch (EntryPointNotFoundException) { CameraOrbitXInputUnavailable = true; }
+            return Vector2.Zero;
         }
 
         private static bool IsVirtualKeyHeld(int virtualKey)
@@ -2254,18 +2302,27 @@ namespace SnowFlyer2
 
         private static bool IsRetryableMatrixBasisRace(byte[] expected, byte[] actual)
         {
+            float[] expectedMatrix = MatrixFloats(expected);
+            float[] actualMatrix = MatrixFloats(actual);
+            if (!TryReconstructSourcePosition(expectedMatrix, out _) ||
+                !TryReconstructSourcePosition(actualMatrix, out _))
+                return false;
+            float expectedDeterminant = MatrixBasisDeterminant(expectedMatrix);
+            if (!IsFiniteFloat(expectedDeterminant) || expectedDeterminant <= 0.25f)
+                return false;
             TryMeasureMatrixReadbackDelta(expected, actual,
                 out float basisDelta, out float translationResidual,
                 out _, out float positionDelta, out float actualDeterminant);
+            // Proper orthonormal bases bound their own elements. Native camera
+            // rotation can span any angle; coherence and verified rollback,
+            // rather than an arbitrary angular delta, decide whether to retry.
             return IsFiniteFloat(basisDelta) &&
                 basisDelta > CameraSourceReadbackBasisTolerance &&
-                basisDelta < CameraSourceReadbackBasisRaceRetryLimit &&
                 IsFiniteFloat(translationResidual) &&
                 translationResidual <= CameraSourceReadbackTranslationResidualTolerance &&
                 IsFiniteFloat(positionDelta) &&
                 positionDelta <= CameraSourceReadbackPositionTolerance &&
-                IsFiniteFloat(actualDeterminant) && actualDeterminant > 0.25f &&
-                TryReconstructSourcePosition(MatrixFloats(actual), out _);
+                IsFiniteFloat(actualDeterminant) && actualDeterminant > 0.25f;
         }
 
         private static bool TryAcceptSmallMatrixReadbackDelta(byte[] expected,

@@ -17,6 +17,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT mes
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -35,7 +36,6 @@ constexpr uint32_t kProtocolMagic = 0x53504631u;
 constexpr uint32_t kMaxTargets = 64;
 constexpr uint32_t kFollow = 1u;
 constexpr uint32_t kFace = 2u;
-constexpr uint32_t kOrbit = 4u;
 constexpr uint32_t kFreeCam = 8u;
 constexpr uint32_t kScanning = 16u;
 
@@ -119,6 +119,14 @@ std::atomic<bool> g_connected{ false };
 std::atomic<bool> g_menuVisible{ true };
 std::atomic<bool> g_captureMouse{ false };
 std::atomic<bool> g_captureKeyboard{ false };
+std::atomic<bool> g_followActive{ false };
+std::atomic<bool> g_dragOwned{ false };
+std::mutex g_gestureMutex;
+float g_mouseDeltaX = 0;
+float g_mouseDeltaY = 0;
+std::atomic<bool> g_rawMouseSeen{ false };
+bool g_legacyMouseBaseline = false;
+POINT g_legacyMousePosition{};
 std::atomic<uint64_t> g_selectedOwner{ 0 };
 std::atomic<int64_t> g_lastResponseTicks{ 0 };
 
@@ -149,7 +157,6 @@ LPVOID g_presentTarget = nullptr;
 LPVOID g_resizeTarget = nullptr;
 
 bool g_uiFace = false;
-bool g_uiOrbit = false;
 float g_uiDistance = 12.0f;
 float g_uiHeight = 3.0f;
 float g_uiSmoothing = 120.0f;
@@ -218,9 +225,30 @@ bool ReadAll(HANDLE pipe, void* data, size_t size)
     return true;
 }
 
+void ClearMouseGesture()
+{
+    g_dragOwned.store(false, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_gestureMutex);
+    g_mouseDeltaX = g_mouseDeltaY = 0;
+    g_legacyMouseBaseline = false;
+}
+
+bool CanOrbitMouse(HWND window)
+{
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return window && GetForegroundWindow() == window &&
+        g_connected.load(std::memory_order_acquire) &&
+        g_followActive.load(std::memory_order_acquire) &&
+        !g_menuVisible.load(std::memory_order_acquire) &&
+        now - g_lastResponseTicks.load(std::memory_order_acquire) < 1000;
+}
+
 void ClearStateDisconnected()
 {
     std::lock_guard<std::mutex> lock(g_stateMutex);
+    g_followActive.store(false, std::memory_order_release);
+    ClearMouseGesture();
     g_state = State{};
     g_lastResponseTicks.store(0, std::memory_order_release);
 }
@@ -230,6 +258,10 @@ bool ReadResponse(HANDLE pipe)
     WireResponseHeader header{};
     if (!ReadAll(pipe, &header, sizeof(header)) || header.magic != kProtocolMagic || header.count > kMaxTargets)
         return false;
+
+    g_followActive.store((header.flags & kFollow) != 0, std::memory_order_release);
+    if ((header.flags & kFollow) == 0)
+        ClearMouseGesture();
 
     State next;
     next.flags = header.flags;
@@ -263,7 +295,9 @@ bool ReadResponse(HANDLE pipe)
 
 bool RoundTrip(HANDLE pipe, const QueuedCommand& command)
 {
-    return WriteAll(pipe, &command.request, sizeof(command.request)) && ReadResponse(pipe);
+    WireRequest request = command.request;
+    request.flags = g_menuVisible.load(std::memory_order_acquire) ? 1u : 0u;
+    return WriteAll(pipe, &request, sizeof(request)) && ReadResponse(pipe);
 }
 
 QueuedCommand MakeCommand(uint32_t command, uint64_t owner = 0, float value = 0, float value2 = 0)
@@ -282,6 +316,8 @@ void QueueCommand(uint32_t command, uint64_t owner = 0, float value = 0, float v
     if (!g_running.load(std::memory_order_acquire) ||
         !g_connected.load(std::memory_order_acquire))
         return;
+    if (command == 2 || command == 3)
+        ClearMouseGesture();
     std::lock_guard<std::mutex> lock(g_commandMutex);
     if (!g_running.load(std::memory_order_acquire) ||
         !g_connected.load(std::memory_order_acquire))
@@ -304,6 +340,21 @@ bool TryTakeCommand(QueuedCommand& command)
         return false;
     command = g_commands.front();
     g_commands.pop_front();
+    return true;
+}
+
+bool TryTakeMouseGesture(QueuedCommand& command)
+{
+    if (!CanOrbitMouse(g_window.load(std::memory_order_acquire)))
+    {
+        ClearMouseGesture();
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_gestureMutex);
+    if (g_mouseDeltaX == 0 && g_mouseDeltaY == 0)
+        return false;
+    command = MakeCommand(8, 0, g_mouseDeltaX, g_mouseDeltaY);
+    g_mouseDeltaX = g_mouseDeltaY = 0;
     return true;
 }
 
@@ -355,7 +406,7 @@ void PipeWorker()
             while (g_running.load(std::memory_order_acquire))
             {
                 QueuedCommand command;
-                if (TryTakeCommand(command))
+                if (TryTakeCommand(command) || TryTakeMouseGesture(command))
                 {
                     if (!RoundTrip(pipe, command))
                         break;
@@ -394,7 +445,8 @@ void DrainWindowMessages()
     }
     for (const Win32Message& message : messages)
     {
-        if (g_imguiReady.load(std::memory_order_acquire) && g_menuVisible.load(std::memory_order_acquire))
+        if (g_imguiReady.load(std::memory_order_acquire) &&
+            (g_menuVisible.load(std::memory_order_acquire) || message.message == WM_KILLFOCUS))
             ImGui_ImplWin32_WndProcHandler(message.hwnd, message.message, message.wParam, message.lParam);
     }
 }
@@ -437,6 +489,7 @@ bool InitializeRenderBackend(IDXGISwapChain* swapChain)
 
     if (g_imguiReady.load(std::memory_order_acquire))
     {
+        ClearMouseGesture();
         g_imguiReady.store(false, std::memory_order_release);
         RestoreWindowProc();
         ImGui_ImplDX11_Shutdown();
@@ -555,7 +608,6 @@ void DrawMenu(State state)
         g_uiSelectedOwner = hasTarget(state.selectedOwner) ? state.selectedOwner :
             (state.targets.empty() ? 0 : state.targets.front().owner);
     g_uiFace = (state.flags & kFace) != 0;
-    g_uiOrbit = (state.flags & kOrbit) != 0;
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 24.0f, viewport->WorkPos.y + 24.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(560.0f, 620.0f), ImGuiCond_FirstUseEver);
@@ -604,13 +656,7 @@ void DrawMenu(State state)
         g_uiFace = face;
         QueueCommand(4, 0, face ? 1.0f : 0.0f);
     }
-    ImGui::SameLine();
-    bool orbit = g_uiOrbit;
-    if (ImGui::Checkbox("Orbit", &orbit) && orbit != g_uiOrbit)
-    {
-        g_uiOrbit = orbit;
-        QueueCommand(5, 0, orbit ? 1.0f : 0.0f);
-    }
+    ImGui::TextWrapped("While following: hold right mouse button and drag, or use the controller right stick, to move around the truck. Hide this menu with Delete first.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("Follow framing");
@@ -683,6 +729,7 @@ void DrawFrame()
 
 void ReleaseImGui()
 {
+    ClearMouseGesture();
     g_imguiReady.store(false, std::memory_order_release);
     g_captureMouse.store(false, std::memory_order_release);
     g_captureKeyboard.store(false, std::memory_order_release);
@@ -743,34 +790,143 @@ LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
 {
     HWND window = g_window.load(std::memory_order_acquire);
     WNDPROC original = g_originalWndProc.load(std::memory_order_acquire);
-    if (!g_imguiReady.load(std::memory_order_acquire) || hwnd != window ||
-        GetForegroundWindow() != hwnd)
-        return original ? CallWindowProcW(original, hwnd, message, wParam, lParam) : DefWindowProcW(hwnd, message, wParam, lParam);
+    const auto forward = [&]()
+    {
+        return original ? CallWindowProcW(original, hwnd, message, wParam, lParam) :
+            DefWindowProcW(hwnd, message, wParam, lParam);
+    };
+    if (!g_imguiReady.load(std::memory_order_acquire) || hwnd != window)
+        return forward();
+
+    // Focus loss must be processed even after the foreground window changes.
+    if (message == WM_KILLFOCUS || (message == WM_ACTIVATEAPP && !wParam))
+    {
+        ClearMouseGesture();
+        g_captureMouse.store(false, std::memory_order_release);
+        g_captureKeyboard.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(g_messageMutex);
+            g_messages.clear();
+            g_messages.push_back({ hwnd, WM_KILLFOCUS, 0, 0 });
+        }
+        return forward();
+    }
+    if (GetForegroundWindow() != hwnd)
+        return forward();
 
     if (message == WM_KEYDOWN && wParam == VK_DELETE && (lParam & (1ll << 30)) == 0)
     {
         g_menuVisible.store(!g_menuVisible.load(std::memory_order_acquire), std::memory_order_release);
-        if (!g_menuVisible.load(std::memory_order_acquire))
-        {
-            g_captureMouse.store(false, std::memory_order_release);
-            g_captureKeyboard.store(false, std::memory_order_release);
-        }
+        ClearMouseGesture();
+        g_captureMouse.store(false, std::memory_order_release);
+        g_captureKeyboard.store(false, std::memory_order_release);
+        // Reset ImGui button/key state across menu transitions.
+        std::lock_guard<std::mutex> lock(g_messageMutex);
+        g_messages.clear();
+        g_messages.push_back({ hwnd, WM_KILLFOCUS, 0, 0 });
         return 0;
     }
 
-    if (g_menuVisible.load(std::memory_order_acquire))
+    if (CanOrbitMouse(hwnd))
+    {
+        if (message == WM_INPUT)
+        {
+            RAWINPUT input{};
+            UINT size = sizeof(input);
+            const UINT read = GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT,
+                &input, &size, sizeof(RAWINPUTHEADER));
+            if (read != static_cast<UINT>(-1) && read >= offsetof(RAWINPUT, data) + sizeof(RAWMOUSE) &&
+                input.header.dwType == RIM_TYPEMOUSE)
+            {
+                const RAWMOUSE& mouse = input.data.mouse;
+                // Some games route raw input to a different window. Legacy
+                // motion is a fallback only until this HWND proves raw support.
+                if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0 &&
+                    !g_rawMouseSeen.exchange(true, std::memory_order_acq_rel))
+                {
+                    std::lock_guard<std::mutex> lock(g_gestureMutex);
+                    g_mouseDeltaX = g_mouseDeltaY = 0;
+                    g_legacyMouseBaseline = false;
+                }
+                const bool owned = g_dragOwned.load(std::memory_order_acquire);
+                const bool down = (mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) != 0;
+                const bool up = (mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP) != 0;
+                const bool held = owned || down || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+                if (held)
+                {
+                    g_dragOwned.store(!up, std::memory_order_release);
+                    if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0)
+                    {
+                        std::lock_guard<std::mutex> lock(g_gestureMutex);
+                        g_mouseDeltaX = std::clamp(g_mouseDeltaX + static_cast<float>(mouse.lLastX), -512.0f, 512.0f);
+                        g_mouseDeltaY = std::clamp(g_mouseDeltaY + static_cast<float>(mouse.lLastY), -512.0f, 512.0f);
+                    }
+                    // Foreground raw input requires DefWindowProc cleanup even
+                    // when withheld from the game's native camera input.
+                    if (GET_RAWINPUT_CODE_WPARAM(wParam) == RIM_INPUT)
+                        DefWindowProcW(hwnd, message, wParam, lParam);
+                    return 0;
+                }
+            }
+        }
+        const bool wasOwned = g_dragOwned.load(std::memory_order_acquire);
+        if (message == WM_RBUTTONDOWN || message == WM_RBUTTONDBLCLK)
+        {
+            g_dragOwned.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(g_gestureMutex);
+                g_legacyMousePosition = { static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+                g_legacyMouseBaseline = true;
+            }
+            return 0;
+        }
+        if (message == WM_RBUTTONUP && wasOwned)
+        {
+            g_dragOwned.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(g_gestureMutex);
+                g_legacyMouseBaseline = false;
+            }
+            return 0;
+        }
+        if (message == WM_MOUSEMOVE && (wasOwned || (wParam & MK_RBUTTON) != 0))
+        {
+            if (!g_rawMouseSeen.load(std::memory_order_acquire))
+            {
+                const POINT position{ static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+                std::lock_guard<std::mutex> lock(g_gestureMutex);
+                if (g_legacyMouseBaseline)
+                {
+                    g_mouseDeltaX = std::clamp(g_mouseDeltaX + static_cast<float>(position.x - g_legacyMousePosition.x), -512.0f, 512.0f);
+                    g_mouseDeltaY = std::clamp(g_mouseDeltaY + static_cast<float>(position.y - g_legacyMousePosition.y), -512.0f, 512.0f);
+                }
+                g_legacyMousePosition = position;
+                g_legacyMouseBaseline = true;
+            }
+            return 0;
+        }
+    }
+    else
+        ClearMouseGesture();
+
+    const bool focusMessage = message == WM_KILLFOCUS || message == WM_SETFOCUS;
+    const bool mouseMessage = message >= WM_MOUSEFIRST && message <= WM_MOUSELAST;
+    const bool keyboardMessage = (message >= WM_KEYFIRST && message <= WM_KEYLAST) ||
+                                 message == WM_CHAR || message == WM_SYSCHAR;
+    if (g_menuVisible.load(std::memory_order_acquire) && (mouseMessage || keyboardMessage || focusMessage))
     {
         std::lock_guard<std::mutex> lock(g_messageMutex);
-        if (g_messages.size() < 256)
+        // Coalesce motion, but always retain releases/focus events. A busy
+        // frame must never leave an ImGui button held indefinitely.
+        if (message == WM_MOUSEMOVE && !g_messages.empty() && g_messages.back().message == WM_MOUSEMOVE)
+            g_messages.back() = { hwnd, message, wParam, lParam };
+        else if (message != WM_MOUSEMOVE || g_messages.size() < 256)
             g_messages.push_back({ hwnd, message, wParam, lParam });
-        const bool mouseMessage = message >= WM_MOUSEFIRST && message <= WM_MOUSELAST;
-        const bool keyboardMessage = (message >= WM_KEYFIRST && message <= WM_KEYLAST) ||
-                                     message == WM_CHAR || message == WM_SYSCHAR;
         if ((mouseMessage && g_captureMouse.load(std::memory_order_acquire)) ||
             (keyboardMessage && g_captureKeyboard.load(std::memory_order_acquire)))
             return 0;
     }
-    return original ? CallWindowProcW(original, hwnd, message, wParam, lParam) : DefWindowProcW(hwnd, message, wParam, lParam);
+    return forward();
 }
 
 HRESULT __stdcall HookedResizeBuffers(IDXGISwapChain* swapChain, UINT bufferCount, UINT width,

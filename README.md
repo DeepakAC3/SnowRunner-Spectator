@@ -22,8 +22,10 @@ helper and `SpectatorUI.dll` together in `bin/Spectator`. Launch with
 
 The native menu draws through the game's D3D11 swap chain. `Delete` opens or
 closes it. Refresh lists validated trucks on the loaded map; select a truck and
-press Spectate. Face truck and Orbit remain optional. The menu also provides
-distance, height, smoothing, and Free camera controls. Closing the menu leaves
+press Spectate. Face truck remains optional. While following with the menu
+closed, hold the right mouse button and drag, or use the controller right stick,
+to move around the truck. Releasing the control keeps the new offset. The menu
+also provides distance, height, smoothing, and Free camera controls. Closing the menu leaves
 a compact follow status display. The list contains trucks, not player names;
 co-op player identity mapping is still an investigation item.
 
@@ -64,9 +66,10 @@ This branch adds a first reverse-engineering aid for the spectator project:
   IDs and physics chassis positions, and lets you attach to a selection. The
   Attach button recenters once near the selected chassis and starts follow.
   `Face truck` is opt-in and makes the validated source camera look at the
-  followed truck while preserving its stored matrix handedness. `Orbit` keeps
-  the current camera radius and lets `Left`/`Right` orbit azimuth and
-  `Up`/`Down` orbit elevation while SnowRunner is focused. The normal freecam
+  followed truck while preserving its stored matrix handedness. Held right mouse
+  drag and the controller right stick adjust the follow offset around the truck
+  while preserving its radius. SnowRunner must be focused and the in-game menu
+  closed. The normal freecam
   `I/K/J/L/O/U` movement keys remain available.
 
 When SnowRunner is the foreground window and freecam is active, the helper
@@ -152,6 +155,13 @@ stop follow. Default follow leaves the native camera
 basis untouched.
 
 ## Runtime evidence (2026-10-04)
+
+The latest control revision removes the Orbit toggle and adds held right-mouse
+drag and XInput right-stick gestures directly to follow. The helper and native
+menu build successfully and passed source review. These gestures still require
+in-game verification after restarting SnowRunner; no controller was connected
+during preparation. With Face truck off, right-stick input also reaches the
+game's native camera rotation.
 
 Release4 found the same three distinct truck chassis and visually attached to
 the inactive Fleetstar without entering it. During a 7.29 m CK1500 drive over

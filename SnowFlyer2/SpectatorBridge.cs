@@ -61,10 +61,20 @@ namespace SnowFlyer2
                                 ulong owner = reader.ReadUInt64();
                                 float value = reader.ReadSingle();
                                 float value2 = reader.ReadSingle();
-                                reader.ReadUInt32(); // flags, reserved for future protocol versions
+                                uint requestFlags = reader.ReadUInt32();
                                 reader.ReadUInt32();
-                                if (magic != SpectatorProtocolMagic || command > 7)
+                                if (magic != SpectatorProtocolMagic || command > 8)
                                     break;
+                                lock (CameraWriteGate)
+                                {
+                                    SpectatorNativeMenuVisible = (requestFlags & 1u) != 0;
+                                    SpectatorNativeInputTimestamp = DateTime.UtcNow.Ticks;
+                                    if (SpectatorNativeMenuVisible)
+                                    {
+                                        CameraOrbitPendingMouseX = 0;
+                                        CameraOrbitPendingMouseY = 0;
+                                    }
+                                }
                                 HandleSpectatorCommand(game, command, owner, value, value2);
                                 WriteSpectatorState(writer);
                             }
@@ -78,6 +88,16 @@ namespace SnowFlyer2
                     if (game.HasExited)
                         return;
                     System.Threading.Thread.Sleep(250);
+                }
+                finally
+                {
+                    lock (CameraWriteGate)
+                    {
+                        SpectatorNativeInputTimestamp = 0;
+                        SpectatorNativeMenuVisible = true;
+                        CameraOrbitPendingMouseX = 0;
+                        CameraOrbitPendingMouseY = 0;
+                    }
                 }
             }
         }
@@ -112,7 +132,7 @@ namespace SnowFlyer2
                     lock (SpectatorBridgeGate) SpectatorBridgeMessage = "Free camera: follow stopped.";
                     return;
                 case 4: SetFaceTruckEnabled(value != 0); return;
-                case 5: SetOrbitModeEnabled(value != 0); return;
+                case 5: return; // Legacy orbit toggle; gestures are inherent in follow.
                 case 6:
                     if (!float.IsNaN(value) && !float.IsInfinity(value) &&
                         !float.IsNaN(value2) && !float.IsInfinity(value2))
@@ -121,6 +141,9 @@ namespace SnowFlyer2
                 case 7:
                     if (!float.IsNaN(value) && !float.IsInfinity(value))
                         SetCameraFollowSmoothing(value / 1000.0f);
+                    return;
+                case 8:
+                    QueueCameraOrbitMouse(game, value, value2);
                     return;
             }
         }
@@ -164,7 +187,7 @@ namespace SnowFlyer2
             lock (CameraWriteGate)
             {
                 flags = (IsFollowingPlayer ? 1u : 0u) | (FaceTruckEnabled ? 2u : 0u) |
-                    (OrbitModeEnabled ? 4u : 0u) | (IsFreeCamActive ? 8u : 0u);
+                    (IsFreeCamActive ? 8u : 0u);
                 selected = unchecked((ulong)SelectedFollowOwner.ToInt64());
                 followStatus = GetCameraFollowStatus();
             }

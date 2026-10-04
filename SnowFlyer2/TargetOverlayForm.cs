@@ -48,9 +48,7 @@ namespace SnowFlyer2
         private readonly Action<FollowTargetInfo> _selectTarget;
         private readonly Func<string> _attach;
         private readonly Action<bool> _setFaceTruck;
-        private readonly Action<bool> _setOrbitMode;
         private readonly Func<bool> _getFaceTruck;
-        private readonly Func<bool> _getOrbitMode;
         private readonly Func<string> _getFollowStatus;
         private readonly Timer _statusTimer = new Timer { Interval = 250 };
         private readonly ListBox _targets = new ListBox();
@@ -63,9 +61,7 @@ namespace SnowFlyer2
             Action<FollowTargetInfo> selectTarget,
             Func<string> attach,
             Action<bool> setFaceTruck,
-            Action<bool> setOrbitMode,
             Func<bool> getFaceTruck,
-            Func<bool> getOrbitMode,
             IntPtr gameWindow,
             Func<string> getFollowStatus = null)
         {
@@ -73,9 +69,7 @@ namespace SnowFlyer2
             _selectTarget = selectTarget;
             _attach = attach;
             _setFaceTruck = setFaceTruck;
-            _setOrbitMode = setOrbitMode;
             _getFaceTruck = getFaceTruck;
-            _getOrbitMode = getOrbitMode;
             _getFollowStatus = getFollowStatus;
 
             Text = "SnowRunner Spectator Targets";
@@ -138,22 +132,9 @@ namespace SnowFlyer2
                 if (_setFaceTruck != null)
                     _setFaceTruck(faceTruck.Checked);
             };
-            CheckBox orbitMode = new CheckBox
-            {
-                Text = "Orbit mode",
-                AutoSize = true,
-                Checked = _getOrbitMode != null && _getOrbitMode(),
-                ForeColor = Color.White,
-                Margin = new Padding(6, 5, 12, 2)
-            };
-            orbitMode.CheckedChanged += (sender, args) =>
-            {
-                if (_setOrbitMode != null)
-                    _setOrbitMode(orbitMode.Checked);
-            };
             Label orbitInstructions = new Label
             {
-                Text = "Orbit: hold Left/Right for azimuth, Up/Down for elevation while SnowRunner is focused. I/K/J/L/O/U stay native.",
+                Text = "While following: hold right mouse and drag, or use the controller right stick, to move around the truck.",
                 AutoSize = false,
                 Width = 340,
                 Height = 30,
@@ -169,7 +150,6 @@ namespace SnowFlyer2
                 WrapContents = false
             };
             modeOptions.Controls.Add(faceTruck);
-            modeOptions.Controls.Add(orbitMode);
             modeOptions.Controls.Add(orbitInstructions);
 
             FlowLayoutPanel controls = new FlowLayoutPanel
