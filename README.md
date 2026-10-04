@@ -40,6 +40,11 @@ This branch adds a first reverse-engineering aid for the spectator project:
   validated truck action owners, shows their exact `trucks_*` asset
   IDs and physics chassis positions, and lets you attach to a selection. The
   Attach button recenters once near the selected chassis and starts follow.
+  `Face truck` is opt-in and makes the validated source camera look at the
+  followed truck while preserving its stored matrix handedness. `Orbit` keeps
+  the current camera radius and lets `Left`/`Right` orbit azimuth and
+  `Up`/`Down` orbit elevation while SnowRunner is focused. The normal freecam
+  `I/K/J/L/O/U` movement keys remain available.
 
 When SnowRunner is the foreground window and freecam is active, the helper
 watches the `M`/`Esc` map boundary: it stops follow, disables freecam, and
@@ -106,10 +111,20 @@ with position at `+0x1A0` (stored Z,Y,X), preserving the full chassis rotation,
 then writes only the source matrix translation. `Ctrl+F12` keeps the current
 camera offset. Overlay Attach performs one guarded recenter near the selected
 chassis using the camera forward vector, then starts the same owner-bound
-follow worker. Selection and every follow tick revalidate the action, asset,
-bone, frame links, and chassis body identity. The scanner scope is the loaded
-map and build-specific offsets above; runtime game verification remains
-required after a new game update.
+follow worker. Release10 uses a monotonic 6 ms deadline with frame-time
+exponential position and angular smoothing at 45 ms. Memory-read duration does
+not add a second variable sleep to each follow tick. Selection and every follow
+tick revalidate the action, asset, bone, frame links, and chassis body identity.
+The scanner scope is the loaded map and build-specific offsets above; runtime
+game verification remains required after a new game update.
+
+When `Face truck` is enabled, follow validates and writes the complete 64-byte
+source matrix as one guarded update. It requires exact or bounded coherent
+readback and cache invalidation. Tiny game-side basis recomposition is accepted
+only when the coherent translation residual and reconstructed position remain
+within the validated 0.1 m bound; any other failure attempts a byte-exact
+matrix rollback and stops follow. Default follow leaves the native camera
+basis untouched.
 
 ## Runtime evidence (2026-10-04)
 
@@ -119,6 +134,18 @@ four seconds, the camera kept the truck in frame and sampled maximum offset
 error was 0.38 m. The ordinary attach/follow path with the final identity
 guards is verified. Rebound and rollback-failure branches were not fault
 injected, and co-op remote-player follow remains unverified.
+
+Release10 moving look-at verification tracked an 11.00 m truck drive over four
+seconds with 731 samples. Source position updates arrived at roughly 5–6 ms;
+the renderer samples in this run had a 32.5 ms median cadence at the current
+30 FPS game rate. These are separate measurements from the older roughly 47 ms
+renderer holds, so they are useful for comparison without being a timing
+guarantee. Aim error was 0.079 degrees median, 0.224 degrees at p99, and
+0.028 degrees at the end. Follow stayed alive before and after the drive.
+Orbit azimuth verification also passed: holding `Right` for 0.4 seconds moved
+the camera 7.82 m around a stationary truck while preserving a 12.958 m radius
+and settling at 0 degrees aim error. Co-op moving follow and injected failure
+branches remain untested.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each

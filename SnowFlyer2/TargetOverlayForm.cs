@@ -47,6 +47,10 @@ namespace SnowFlyer2
         private readonly Func<IReadOnlyList<FollowTargetInfo>> _refreshTargets;
         private readonly Action<FollowTargetInfo> _selectTarget;
         private readonly Func<string> _attach;
+        private readonly Action<bool> _setFaceTruck;
+        private readonly Action<bool> _setOrbitMode;
+        private readonly Func<bool> _getFaceTruck;
+        private readonly Func<bool> _getOrbitMode;
         private readonly ListBox _targets = new ListBox();
         private readonly Label _status = new Label();
         private bool _refreshing;
@@ -55,11 +59,19 @@ namespace SnowFlyer2
             Func<IReadOnlyList<FollowTargetInfo>> refreshTargets,
             Action<FollowTargetInfo> selectTarget,
             Func<string> attach,
+            Action<bool> setFaceTruck,
+            Action<bool> setOrbitMode,
+            Func<bool> getFaceTruck,
+            Func<bool> getOrbitMode,
             IntPtr gameWindow)
         {
             _refreshTargets = refreshTargets;
             _selectTarget = selectTarget;
             _attach = attach;
+            _setFaceTruck = setFaceTruck;
+            _setOrbitMode = setOrbitMode;
+            _getFaceTruck = getFaceTruck;
+            _getOrbitMode = getOrbitMode;
 
             Text = "SnowRunner Spectator Targets";
             FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -103,6 +115,53 @@ namespace SnowFlyer2
             attachButton.Click += (sender, args) => SetStatus(_attach());
             Button close = new Button { Text = "Close", Width = 90, Height = 28 };
             close.Click += (sender, args) => Close();
+            CheckBox faceTruck = new CheckBox
+            {
+                Text = "Face truck",
+                AutoSize = true,
+                Checked = _getFaceTruck != null && _getFaceTruck(),
+                ForeColor = Color.White,
+                Margin = new Padding(6, 5, 12, 2)
+            };
+            faceTruck.CheckedChanged += (sender, args) =>
+            {
+                if (_setFaceTruck != null)
+                    _setFaceTruck(faceTruck.Checked);
+            };
+            CheckBox orbitMode = new CheckBox
+            {
+                Text = "Orbit mode",
+                AutoSize = true,
+                Checked = _getOrbitMode != null && _getOrbitMode(),
+                ForeColor = Color.White,
+                Margin = new Padding(6, 5, 12, 2)
+            };
+            orbitMode.CheckedChanged += (sender, args) =>
+            {
+                if (_setOrbitMode != null)
+                    _setOrbitMode(orbitMode.Checked);
+            };
+            Label orbitInstructions = new Label
+            {
+                Text = "Orbit: hold Left/Right for azimuth, Up/Down for elevation while SnowRunner is focused. I/K/J/L/O/U stay native.",
+                AutoSize = false,
+                Width = 340,
+                Height = 30,
+                ForeColor = Color.LightGray,
+                Margin = new Padding(4, 2, 4, 2)
+            };
+            FlowLayoutPanel modeOptions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                Height = 48,
+                Padding = new Padding(2),
+                BackColor = Color.FromArgb(30, 30, 30),
+                WrapContents = false
+            };
+            modeOptions.Controls.Add(faceTruck);
+            modeOptions.Controls.Add(orbitMode);
+            modeOptions.Controls.Add(orbitInstructions);
+
             FlowLayoutPanel controls = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
@@ -117,9 +176,17 @@ namespace SnowFlyer2
             _status.Height = 28;
             _status.Padding = new Padding(8, 5, 0, 0);
             _status.ForeColor = Color.LightGray;
+            Panel footer = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 92,
+                BackColor = Color.FromArgb(30, 30, 30)
+            };
+            footer.Controls.Add(modeOptions);
+            footer.Controls.Add(_status);
+            footer.Controls.Add(controls);
             Controls.Add(_targets);
-            Controls.Add(_status);
-            Controls.Add(controls);
+            Controls.Add(footer);
             Controls.Add(title);
 
             KeyDown += (sender, args) =>

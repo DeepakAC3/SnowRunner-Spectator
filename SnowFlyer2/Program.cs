@@ -105,6 +105,18 @@ namespace SnowFlyer2
         private static int CameraFollowGeneration;
         private static Vector3 CameraFollowLastRequested;
         private static bool CameraFollowHasLastRequested;
+        private static Vector3 CameraFollowSmoothedPosition;
+        private static bool CameraFollowHasSmoothedPosition;
+        private static Vector3 CameraFollowSmoothedForward;
+        private static bool CameraFollowHasSmoothedForward;
+        private static long CameraFollowLastSampleTimestamp;
+        private static float CameraOrbitAzimuth;
+        private static float CameraOrbitElevation;
+        private static float CameraOrbitRadius;
+        private static bool CameraOrbitHasState;
+        private static volatile bool FaceTruckEnabled;
+        private static volatile bool OrbitModeEnabled;
+        private static DateTime LastMatrixReadbackAdjustmentLog = DateTime.MinValue;
         private static IntPtr SelectedFollowOwner;
         private static IntPtr SelectedFollowAction;
         private static IntPtr SelectedFollowBody;
@@ -191,7 +203,18 @@ namespace SnowFlyer2
         private const float CameraFollowNoiseThreshold = 0.001f;
         private const float CameraFollowMaxIncrement = 50.0f;
         private const float CameraFollowMaxTruckJump = 100.0f;
-        private const int CameraFollowPeriodMilliseconds = 33;
+        // The follow worker uses a monotonic deadline instead of sleeping for a
+        // fixed interval after its memory reads. This keeps camera writes evenly
+        // spaced when a read pass takes a little longer than usual.
+        private const int CameraFollowPeriodMilliseconds = 6;
+        private const float CameraFollowPositionSmoothingSeconds = 0.045f;
+        private const float CameraFollowRotationSmoothingSeconds = 0.045f;
+        private const int CameraFollowMaxMatrixGuardSkips = 8;
+        private const float CameraSourceReadbackBasisTolerance = 0.00005f;
+        private const float CameraSourceReadbackTranslationResidualTolerance = CameraSourcePositionTolerance;
+        private const float CameraSourceReadbackPositionTolerance = CameraSourcePositionTolerance;
+        private const float CameraOrbitAngularSpeed = 1.8f;
+        private const float CameraOrbitMaxElevation = 1.3962634f; // 80 degrees
         private const int CameraSourceStableReadAttempts = 3;
         private const int CameraSourceStableReadDelayMilliseconds = 2;
         private const int VirtualKeyI = 0x49;
@@ -200,6 +223,10 @@ namespace SnowFlyer2
         private const int VirtualKeyL = 0x4C;
         private const int VirtualKeyO = 0x4F;
         private const int VirtualKeyU = 0x55;
+        private const int VirtualKeyLeft = 0x25;
+        private const int VirtualKeyUp = 0x26;
+        private const int VirtualKeyRight = 0x27;
+        private const int VirtualKeyDown = 0x28;
         private const int VirtualKeyM = 0x4D;
         private const int VirtualKeyEscape = 0x1B;
         // Legacy rig chain; never use it for rendered-camera diagnostics.
@@ -227,6 +254,12 @@ namespace SnowFlyer2
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int virtualKey);
+
+        [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+        private static extern uint TimeBeginPeriod(uint period);
+
+        [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+        private static extern uint TimeEndPeriod(uint period);
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
@@ -623,6 +656,8 @@ namespace SnowFlyer2
                 {
                     IsFollowingPlayer = false;
                     CameraFollowGeneration++;
+                    ResetCameraFollowSmoothingLocked(default(Vector3));
+                    ResetCameraOrbitLocked();
                     Console.WriteLine("Camera follow stopped.");
                     return;
                 }
@@ -681,6 +716,8 @@ namespace SnowFlyer2
                     CameraFollowLocalOffset = WorldOffsetToLocal(CameraFollowOffset, target.Basis);
                     CameraFollowLastRequested = source.WorldPosition;
                     CameraFollowHasLastRequested = true;
+                    ResetCameraFollowSmoothingLocked(source.WorldPosition);
+                    ResetCameraOrbitLocked();
                     IsFollowingPlayer = true;
 
                     int generation = ++CameraFollowGeneration;
@@ -715,9 +752,73 @@ namespace SnowFlyer2
                 () => ScanValidatedTruckTargets(snowRunnerProcess),
                 SelectFollowTarget,
                 () => AttachSelectedTruck(snowRunnerProcess),
+                value => SetFaceTruckEnabled(value),
+                value => SetOrbitModeEnabled(value),
+                () => FaceTruckEnabled,
+                () => OrbitModeEnabled,
                 snowRunnerProcess.MainWindowHandle);
             TargetOverlay.FormClosed += (sender, args) => TargetOverlay = null;
             TargetOverlay.Show();
+        }
+
+        private static void SetFaceTruckEnabled(bool enabled)
+        {
+            lock (CameraWriteGate)
+            {
+                FaceTruckEnabled = enabled;
+                CameraFollowHasSmoothedForward = false;
+            }
+            Console.WriteLine(enabled
+                ? "Face truck enabled for validated follow."
+                : "Face truck disabled; follow preserves native camera rotation.");
+        }
+
+        private static void SetOrbitModeEnabled(bool enabled)
+        {
+            lock (CameraWriteGate)
+            {
+                OrbitModeEnabled = enabled;
+                if (enabled)
+                    InitializeCameraOrbitLocked();
+                else
+                    CameraOrbitHasState = false;
+            }
+            Console.WriteLine(enabled
+                ? "Orbit mode enabled. Hold arrow keys while SnowRunner is focused."
+                : "Orbit mode disabled.");
+        }
+
+        private static void ResetCameraFollowSmoothingLocked(Vector3 initialPosition)
+        {
+            CameraFollowSmoothedPosition = initialPosition;
+            CameraFollowHasSmoothedPosition = initialPosition != default(Vector3);
+            CameraFollowSmoothedForward = default(Vector3);
+            CameraFollowHasSmoothedForward = false;
+            CameraFollowLastSampleTimestamp = 0;
+        }
+
+        private static void ResetCameraOrbitLocked()
+        {
+            CameraOrbitAzimuth = 0.0f;
+            CameraOrbitElevation = 0.0f;
+            CameraOrbitRadius = 0.0f;
+            CameraOrbitHasState = false;
+        }
+
+        private static void InitializeCameraOrbitLocked()
+        {
+            if (CameraFollowLocalOffset.LengthSquared() < 0.01f)
+            {
+                ResetCameraOrbitLocked();
+                return;
+            }
+
+            CameraOrbitRadius = CameraFollowLocalOffset.Length();
+            CameraOrbitAzimuth = (float)Math.Atan2(CameraFollowLocalOffset.X,
+                CameraFollowLocalOffset.Z);
+            CameraOrbitElevation = (float)Math.Asin(Math.Max(-1.0f,
+                Math.Min(1.0f, CameraFollowLocalOffset.Y / CameraOrbitRadius)));
+            CameraOrbitHasState = true;
         }
 
         private static void SelectFollowTarget(FollowTargetInfo target)
@@ -730,6 +831,8 @@ namespace SnowFlyer2
                 {
                     IsFollowingPlayer = false;
                     CameraFollowGeneration++;
+                    ResetCameraFollowSmoothingLocked(default(Vector3));
+                    ResetCameraOrbitLocked();
                     Console.WriteLine("Camera follow stopped before changing target.");
                 }
                 SelectedFollowOwner = target.OwnerAddress;
@@ -737,6 +840,8 @@ namespace SnowFlyer2
                 SelectedFollowBody = target.ChassisBodyAddress;
                 SelectedFollowFrame = target.FrameAddress;
                 SelectedFollowAssetId = target.AssetId;
+                ResetCameraFollowSmoothingLocked(default(Vector3));
+                ResetCameraOrbitLocked();
             }
             Console.WriteLine($"Selected truck chassis {target.AssetId} {target.Address.ToInt64():X} at " +
                 $"{target.Position.X:F2} {target.Position.Y:F2} {target.Position.Z:F2}.");
@@ -815,12 +920,16 @@ namespace SnowFlyer2
                     {
                         IsFollowingPlayer = false;
                         CameraFollowGeneration++;
+                        ResetCameraFollowSmoothingLocked(default(Vector3));
+                        ResetCameraOrbitLocked();
                     }
                     CameraFollowOffset = attachPosition - target.Position;
                     CameraFollowLocalOffset = WorldOffsetToLocal(CameraFollowOffset,
                         target.Basis);
                     CameraFollowLastRequested = attachPosition;
                     CameraFollowHasLastRequested = true;
+                    ResetCameraFollowSmoothingLocked(attachPosition);
+                    ResetCameraOrbitLocked();
                     IsFollowingPlayer = true;
                     int generation = ++CameraFollowGeneration;
                     Task.Run(() => TrackCameraFollow(snowRunnerProcess,
@@ -897,6 +1006,8 @@ namespace SnowFlyer2
                 {
                     IsFollowingPlayer = false;
                     CameraFollowGeneration++;
+                    ResetCameraFollowSmoothingLocked(default(Vector3));
+                    ResetCameraOrbitLocked();
                 }
             }
             Console.WriteLine("Map opening: follow stopped and freecam is being disabled.");
@@ -1300,6 +1411,8 @@ namespace SnowFlyer2
                 {
                     IsFollowingPlayer = false;
                     CameraFollowGeneration++;
+                    ResetCameraFollowSmoothingLocked(default(Vector3));
+                    ResetCameraOrbitLocked();
                     Console.WriteLine("Camera follow stopped before camera nudge.");
                 }
             }
@@ -1401,18 +1514,32 @@ namespace SnowFlyer2
                 return;
             }
 
+            bool timerResolutionActive = false;
             try
             {
+                timerResolutionActive = TimeBeginPeriod(1) == 0;
                 Vector3 previousPlayer = default;
                 bool hasPreviousPlayer = false;
                 DateTime lastStatus = DateTime.UtcNow;
+                long periodTicks = Math.Max(1L, (long)(Stopwatch.Frequency *
+                    (CameraFollowPeriodMilliseconds / 1000.0)));
+                long nextDeadline = Stopwatch.GetTimestamp();
+                int matrixGuardMismatchCount = 0;
                 while (true)
                 {
+                    nextDeadline += periodTicks;
                     string failure = null;
                     lock (CameraWriteGate)
                     {
                         if (!IsFollowingGeneration(generation))
                             return;
+
+                        long now = Stopwatch.GetTimestamp();
+                        float deltaSeconds = CameraFollowLastSampleTimestamp == 0
+                            ? CameraFollowPeriodMilliseconds / 1000.0f
+                            : (float)(now - CameraFollowLastSampleTimestamp) / Stopwatch.Frequency;
+                        CameraFollowLastSampleTimestamp = now;
+                        deltaSeconds = Math.Max(0.001f, Math.Min(0.10f, deltaSeconds));
 
                         CameraSourceSnapshot source;
                         if (!TryReadTruckScanIdentity(processHandle, moduleBase,
@@ -1448,17 +1575,65 @@ namespace SnowFlyer2
                                 if (residualLength > CameraFollowMaxIncrement)
                                     failure = "Native camera movement exceeded the per-frame follow bound.";
                                 else if (residualLength > CameraFollowNoiseThreshold)
+                                {
                                     CameraFollowLocalOffset += WorldOffsetToLocal(residual, target.Basis);
+                                    // Native I/K/J/L/O/U movement is an intentional
+                                    // change of offset. Rebase the filter so it does
+                                    // not pull the camera back toward its old state.
+                                    CameraFollowSmoothedPosition = source.WorldPosition;
+                                    CameraFollowHasSmoothedPosition = true;
+                                    if (OrbitModeEnabled)
+                                        InitializeCameraOrbitLocked();
+                                }
                             }
 
+                            if (failure == null)
+                                UpdateCameraOrbitLocked(snowRunnerProcess, deltaSeconds);
+
                             CameraFollowOffset = LocalOffsetToWorld(CameraFollowLocalOffset, target.Basis);
-                            Vector3 targetPosition = target.Position + CameraFollowOffset;
+                            Vector3 rawTargetPosition = target.Position + CameraFollowOffset;
+                            Vector3 desiredPosition = rawTargetPosition;
+
+                            if (!CameraFollowHasSmoothedPosition)
+                            {
+                                CameraFollowSmoothedPosition = source.WorldPosition;
+                                CameraFollowHasSmoothedPosition = true;
+                            }
+                            float smoothingAlpha = 1.0f - (float)Math.Exp(
+                                -deltaSeconds / CameraFollowPositionSmoothingSeconds);
+                            CameraFollowSmoothedPosition +=
+                                (desiredPosition - CameraFollowSmoothedPosition) * smoothingAlpha;
+                            Vector3 targetPosition = CameraFollowSmoothedPosition;
                             Vector3 increment = targetPosition - source.WorldPosition;
+                            byte[] lookAtMatrix = null;
+                            bool matrixGuardMismatch = false;
                             if (failure == null && increment.Length() > CameraFollowMaxIncrement)
                             {
                                 failure = "Camera follow increment exceeded the per-frame bound.";
                             }
-                            else if (failure == null &&
+                            else if (failure == null && FaceTruckEnabled &&
+                                !TryBuildLookAtMatrixBytes(source.Matrix, targetPosition,
+                                    target.Position, deltaSeconds, out lookAtMatrix))
+                            {
+                                failure = "Camera follow look-at basis could not be constructed.";
+                            }
+                            else if (failure == null && FaceTruckEnabled &&
+                                !TryWriteSourceMatrix(processHandle, source.Transform,
+                                    lookAtMatrix, MatrixBytes(source.Matrix),
+                                    out matrixGuardMismatch))
+                            {
+                                if (matrixGuardMismatch)
+                                {
+                                    matrixGuardMismatchCount++;
+                                    if (matrixGuardMismatchCount >= CameraFollowMaxMatrixGuardSkips)
+                                        failure = "Camera source matrix changed repeatedly before look-at write.";
+                                }
+                                else
+                                {
+                                    failure = "Camera follow could not write the validated source matrix.";
+                                }
+                            }
+                            else if (failure == null && !FaceTruckEnabled &&
                                 !TryWriteSourceTranslation(processHandle, source.Transform,
                                     BuildTranslationBytes(source.Matrix, targetPosition)))
                             {
@@ -1466,6 +1641,7 @@ namespace SnowFlyer2
                             }
                             else if (failure == null)
                             {
+                                matrixGuardMismatchCount = 0;
                                 CameraFollowLastRequested = targetPosition;
                                 CameraFollowHasLastRequested = true;
                                 if ((DateTime.UtcNow - lastStatus).TotalSeconds >= 1.0)
@@ -1478,8 +1654,13 @@ namespace SnowFlyer2
                                     lastStatus = DateTime.UtcNow;
                                 }
                             }
-                            previousPlayer = target.Position;
-                            hasPreviousPlayer = true;
+                            if (!hasPreviousPlayer ||
+                                Vector3.DistanceSquared(target.Position, previousPlayer) >
+                                    CameraFollowNoiseThreshold * CameraFollowNoiseThreshold)
+                            {
+                                previousPlayer = target.Position;
+                                hasPreviousPlayer = true;
+                            }
                         }
 
                         if (failure != null)
@@ -1493,7 +1674,23 @@ namespace SnowFlyer2
                         Console.WriteLine(failure);
                         return;
                     }
-                    Thread.Sleep(CameraFollowPeriodMilliseconds);
+
+                    // Keep a monotonic deadline. A fixed sleep after the read/write
+                    // pass compounds the pass duration and produces visible jitter.
+                    long remainingTicks = nextDeadline - Stopwatch.GetTimestamp();
+                    if (remainingTicks <= 0)
+                    {
+                        nextDeadline = Stopwatch.GetTimestamp();
+                    }
+                    else
+                    {
+                        int sleepMilliseconds = (int)(remainingTicks * 1000L /
+                            Stopwatch.Frequency);
+                        if (sleepMilliseconds > 1)
+                            Thread.Sleep(Math.Min(sleepMilliseconds, 4));
+                        else
+                            Thread.SpinWait(250);
+                    }
                 }
             }
             catch (Exception ex)
@@ -1502,8 +1699,286 @@ namespace SnowFlyer2
             }
             finally
             {
+                if (timerResolutionActive)
+                    TimeEndPeriod(1);
                 CloseHandle(processHandle);
             }
+        }
+
+        private static void UpdateCameraOrbitLocked(Process snowRunnerProcess,
+            float deltaSeconds)
+        {
+            if (!OrbitModeEnabled)
+                return;
+            if (!CameraOrbitHasState)
+                InitializeCameraOrbitLocked();
+            if (!CameraOrbitHasState || !IsSnowRunnerForeground(snowRunnerProcess))
+                return;
+
+            float azimuthDelta = 0.0f;
+            float elevationDelta = 0.0f;
+            if (IsVirtualKeyHeld(VirtualKeyLeft))
+                azimuthDelta -= 1.0f;
+            if (IsVirtualKeyHeld(VirtualKeyRight))
+                azimuthDelta += 1.0f;
+            if (IsVirtualKeyHeld(VirtualKeyUp))
+                elevationDelta += 1.0f;
+            if (IsVirtualKeyHeld(VirtualKeyDown))
+                elevationDelta -= 1.0f;
+
+            CameraOrbitAzimuth += azimuthDelta * CameraOrbitAngularSpeed * deltaSeconds;
+            CameraOrbitElevation = Math.Max(-CameraOrbitMaxElevation,
+                Math.Min(CameraOrbitMaxElevation,
+                    CameraOrbitElevation + elevationDelta * CameraOrbitAngularSpeed * deltaSeconds));
+            if (azimuthDelta == 0.0f && elevationDelta == 0.0f)
+                return;
+
+            float cosElevation = (float)Math.Cos(CameraOrbitElevation);
+            CameraFollowLocalOffset = new Vector3(
+                (float)Math.Sin(CameraOrbitAzimuth) * cosElevation * CameraOrbitRadius,
+                (float)Math.Sin(CameraOrbitElevation) * CameraOrbitRadius,
+                (float)Math.Cos(CameraOrbitAzimuth) * cosElevation * CameraOrbitRadius);
+        }
+
+        private static bool IsVirtualKeyHeld(int virtualKey)
+        {
+            return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+        }
+
+        private static bool TryBuildLookAtMatrixBytes(float[] sourceMatrix,
+            Vector3 cameraWorld, Vector3 targetWorld, float deltaSeconds,
+            out byte[] matrixBytes)
+        {
+            matrixBytes = null;
+            if (sourceMatrix == null || sourceMatrix.Length != 16 ||
+                !IsFiniteVector(cameraWorld) || !IsFiniteVector(targetWorld))
+                return false;
+
+            Vector3 storedForward = WorldToStored(targetWorld - cameraWorld);
+            if (!IsFiniteVector(storedForward) || storedForward.LengthSquared() < 0.0001f)
+                return false;
+            storedForward = Vector3.Normalize(storedForward);
+            if (!CameraFollowHasSmoothedForward)
+            {
+                CameraFollowSmoothedForward = storedForward;
+                CameraFollowHasSmoothedForward = true;
+            }
+            else
+            {
+                float rotationAlpha = 1.0f - (float)Math.Exp(
+                    -Math.Max(0.001f, Math.Min(0.10f, deltaSeconds)) /
+                    CameraFollowRotationSmoothingSeconds);
+                CameraFollowSmoothedForward +=
+                    (storedForward - CameraFollowSmoothedForward) * rotationAlpha;
+                if (CameraFollowSmoothedForward.LengthSquared() < 0.0001f)
+                    return false;
+                CameraFollowSmoothedForward = Vector3.Normalize(CameraFollowSmoothedForward);
+            }
+            storedForward = CameraFollowSmoothedForward;
+
+            Vector3 storedUp = new Vector3(0.0f, 1.0f, 0.0f);
+            if (Math.Abs(Vector3.Dot(storedUp, storedForward)) > 0.98f)
+                storedUp = Vector3.Normalize(new Vector3(sourceMatrix[1],
+                    sourceMatrix[5], sourceMatrix[9]));
+            if (!IsFiniteVector(storedUp) || storedUp.LengthSquared() < 0.5f ||
+                Math.Abs(Vector3.Dot(storedUp, storedForward)) > 0.98f)
+                storedUp = new Vector3(1.0f, 0.0f, 0.0f);
+
+            Vector3 storedRight = Vector3.Cross(storedUp, storedForward);
+            if (storedRight.LengthSquared() < 0.0001f)
+                return false;
+            storedRight = Vector3.Normalize(storedRight);
+            storedUp = Vector3.Normalize(Vector3.Cross(storedForward, storedRight));
+
+            float sourceDeterminant = MatrixBasisDeterminant(sourceMatrix);
+            float desiredDeterminant = Vector3.Dot(storedRight,
+                Vector3.Cross(storedUp, storedForward));
+            if (!IsFiniteFloat(sourceDeterminant) || sourceDeterminant <= 0.25f ||
+                !IsFiniteFloat(desiredDeterminant) || desiredDeterminant <= 0.25f)
+                return false;
+            // The validated source uses the positive determinant in its stored
+            // Z,Y,X basis. Refuse an unexpected handedness rather than silently
+            // introducing a roll or swapping the renderer's convention.
+
+            Vector3 storedCamera = WorldToStored(cameraWorld);
+            float[] matrix = new float[16];
+            matrix[0] = storedRight.X;
+            matrix[1] = storedUp.X;
+            matrix[2] = storedForward.X;
+            matrix[4] = storedRight.Y;
+            matrix[5] = storedUp.Y;
+            matrix[6] = storedForward.Y;
+            matrix[8] = storedRight.Z;
+            matrix[9] = storedUp.Z;
+            matrix[10] = storedForward.Z;
+            matrix[15] = 1.0f;
+            matrix[12] = -Vector3.Dot(storedCamera, storedRight);
+            matrix[13] = -Vector3.Dot(storedCamera, storedUp);
+            matrix[14] = -Vector3.Dot(storedCamera, storedForward);
+            if (matrix.Any(value => !IsFiniteFloat(value)))
+                return false;
+
+            matrixBytes = MatrixBytes(matrix);
+            return matrixBytes != null && matrixBytes.Length == CameraSourceMatrixSize;
+        }
+
+        private static Vector3 WorldToStored(Vector3 world)
+        {
+            return new Vector3(world.Z, world.Y, world.X);
+        }
+
+        private static float MatrixBasisDeterminant(float[] matrix)
+        {
+            Vector3 column0 = new Vector3(matrix[0], matrix[4], matrix[8]);
+            Vector3 column1 = new Vector3(matrix[1], matrix[5], matrix[9]);
+            Vector3 column2 = new Vector3(matrix[2], matrix[6], matrix[10]);
+            return Vector3.Dot(column0, Vector3.Cross(column1, column2));
+        }
+
+        private static byte[] MatrixBytes(float[] matrix)
+        {
+            if (matrix == null || matrix.Length != 16)
+                return null;
+            byte[] bytes = new byte[CameraSourceMatrixSize];
+            for (int index = 0; index < matrix.Length; index++)
+                Buffer.BlockCopy(BitConverter.GetBytes(matrix[index]), 0, bytes, index * 4, 4);
+            return bytes;
+        }
+
+        private static bool TryWriteSourceMatrix(IntPtr processHandle,
+            IntPtr transform, byte[] matrix, byte[] expectedPrior,
+            out bool guardMismatch)
+        {
+            guardMismatch = false;
+            if (matrix == null || matrix.Length != CameraSourceMatrixSize)
+                return false;
+            byte[] prior = new byte[CameraSourceMatrixSize];
+            if (!TryReadBytes(processHandle, new IntPtr(transform.ToInt64()), prior))
+                return false;
+            if (expectedPrior != null && !prior.SequenceEqual(expectedPrior))
+            {
+                guardMismatch = true;
+                return false;
+            }
+
+            bool wrote = TryWriteBytes(processHandle, new IntPtr(transform.ToInt64()), matrix);
+            byte[] readback = new byte[CameraSourceMatrixSize];
+            bool readbackAvailable = wrote &&
+                TryReadBytes(processHandle, new IntPtr(transform.ToInt64()), readback);
+            bool readBackExactly = readbackAvailable && readback.SequenceEqual(matrix);
+            if (readbackAvailable && !readBackExactly)
+            {
+                if (TryAcceptSmallMatrixReadbackDelta(matrix, readback,
+                    out float acceptedBasisDelta, out float acceptedTranslationResidual,
+                    out float acceptedRawTranslationDelta,
+                    out float acceptedPositionDelta, out float acceptedDeterminant))
+                {
+                    if ((DateTime.UtcNow - LastMatrixReadbackAdjustmentLog).TotalSeconds >= 1.0)
+                    {
+                        Console.WriteLine($"Camera source matrix readback adjusted by game: " +
+                            $"basis {acceptedBasisDelta:F7}, raw translation {acceptedRawTranslationDelta:F7}, " +
+                            $"coherent residual {acceptedTranslationResidual:F7}, " +
+                            $"position {acceptedPositionDelta:F4}, det {acceptedDeterminant:F5}; accepting bounded delta.");
+                        LastMatrixReadbackAdjustmentLog = DateTime.UtcNow;
+                    }
+                    readBackExactly = true;
+                }
+                else
+                {
+                    TryMeasureMatrixReadbackDelta(matrix, readback,
+                        out float measuredBasisDelta, out float measuredTranslationResidual,
+                        out float measuredRawTranslationDelta,
+                        out float measuredPositionDelta, out float measuredDeterminant);
+                    Console.WriteLine($"Camera source matrix readback mismatch: " +
+                        $"basis {measuredBasisDelta:F7}, raw translation {measuredRawTranslationDelta:F7}, " +
+                        $"coherent residual {measuredTranslationResidual:F7}, " +
+                        $"position {measuredPositionDelta:F4}, det {measuredDeterminant:F5}; rolling back.");
+                }
+            }
+            bool cachesInvalidated = readBackExactly &&
+                TryInvalidateSourceCaches(processHandle, transform);
+            if (readBackExactly && cachesInvalidated)
+                return true;
+
+            bool rollbackWrite = TryWriteBytes(processHandle,
+                new IntPtr(transform.ToInt64()), prior);
+            byte[] rollbackReadback = new byte[CameraSourceMatrixSize];
+            bool rollbackRead = rollbackWrite &&
+                TryReadBytes(processHandle, new IntPtr(transform.ToInt64()), rollbackReadback) &&
+                rollbackReadback.SequenceEqual(prior);
+            bool rollbackCaches = TryInvalidateSourceCaches(processHandle, transform);
+            if (!rollbackWrite || !rollbackRead || !rollbackCaches)
+                Console.WriteLine("Camera source matrix write failed and byte-exact rollback verification failed.");
+            return false;
+        }
+
+        private static bool TryAcceptSmallMatrixReadbackDelta(byte[] expected,
+            byte[] actual, out float basisDelta, out float translationResidual,
+            out float rawTranslationDelta, out float positionDelta,
+            out float actualDeterminant)
+        {
+            TryMeasureMatrixReadbackDelta(expected, actual, out basisDelta,
+                out translationResidual, out rawTranslationDelta, out positionDelta,
+                out actualDeterminant);
+            return basisDelta <= CameraSourceReadbackBasisTolerance &&
+                translationResidual <= CameraSourceReadbackTranslationResidualTolerance &&
+                positionDelta <= CameraSourceReadbackPositionTolerance &&
+                actualDeterminant > 0.25f;
+        }
+
+        private static void TryMeasureMatrixReadbackDelta(byte[] expected,
+            byte[] actual, out float basisDelta, out float translationResidual,
+            out float rawTranslationDelta, out float positionDelta,
+            out float actualDeterminant)
+        {
+            basisDelta = float.PositiveInfinity;
+            translationResidual = float.PositiveInfinity;
+            rawTranslationDelta = float.PositiveInfinity;
+            positionDelta = float.PositiveInfinity;
+            actualDeterminant = float.NaN;
+            if (expected == null || actual == null ||
+                expected.Length != CameraSourceMatrixSize ||
+                actual.Length != CameraSourceMatrixSize)
+                return;
+            float[] expectedMatrix = MatrixFloats(expected);
+            float[] actualMatrix = MatrixFloats(actual);
+            if (expectedMatrix == null || actualMatrix == null ||
+                expectedMatrix.Any(value => !IsFiniteFloat(value)) ||
+                actualMatrix.Any(value => !IsFiniteFloat(value)))
+                return;
+            int[] basisIndices = { 0, 1, 2, 4, 5, 6, 8, 9, 10 };
+            basisDelta = 0.0f;
+            foreach (int index in basisIndices)
+                basisDelta = Math.Max(basisDelta,
+                    Math.Abs(expectedMatrix[index] - actualMatrix[index]));
+            rawTranslationDelta = 0.0f;
+            for (int index = 12; index <= 14; index++)
+                rawTranslationDelta = Math.Max(rawTranslationDelta,
+                    Math.Abs(expectedMatrix[index] - actualMatrix[index]));
+            if (TryReconstructSourcePosition(expectedMatrix, out Vector3 expectedPosition) &&
+                TryReconstructSourcePosition(actualMatrix, out Vector3 actualPosition))
+            {
+                positionDelta = MaxAbsDifference(expectedPosition, actualPosition);
+                Vector3 recomposedTranslation = new Vector3(
+                    -(expectedPosition.X * actualMatrix[0] + expectedPosition.Y * actualMatrix[4] + expectedPosition.Z * actualMatrix[8]),
+                    -(expectedPosition.X * actualMatrix[1] + expectedPosition.Y * actualMatrix[5] + expectedPosition.Z * actualMatrix[9]),
+                    -(expectedPosition.X * actualMatrix[2] + expectedPosition.Y * actualMatrix[6] + expectedPosition.Z * actualMatrix[10]));
+                Vector3 actualTranslation = new Vector3(actualMatrix[12],
+                    actualMatrix[13], actualMatrix[14]);
+                translationResidual = MaxAbsDifference(actualTranslation,
+                    recomposedTranslation);
+            }
+            actualDeterminant = MatrixBasisDeterminant(actualMatrix);
+        }
+
+        private static float[] MatrixFloats(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length != CameraSourceMatrixSize)
+                return null;
+            float[] matrix = new float[16];
+            for (int index = 0; index < matrix.Length; index++)
+                matrix[index] = BitConverter.ToSingle(bytes, index * 4);
+            return matrix;
         }
 
         private static bool IsFollowingGeneration(int generation)
@@ -1517,6 +1992,8 @@ namespace SnowFlyer2
             {
                 IsFollowingPlayer = false;
                 CameraFollowGeneration++;
+                ResetCameraFollowSmoothingLocked(default(Vector3));
+                ResetCameraOrbitLocked();
             }
         }
 
