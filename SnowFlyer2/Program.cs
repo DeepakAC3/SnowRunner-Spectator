@@ -94,9 +94,9 @@ namespace SnowFlyer2
         private static bool IsTrackingCameraCoords = false;
         private static bool IsFollowingPlayer = false;
         private static Vector3 CameraFollowOffset;
+        private static Vector3 CameraFollowLocalOffset;
         private static readonly object CameraWriteGate = new object();
         private static int CameraFollowGeneration;
-        private static IntPtr CameraFollowTransform;
         private static Vector3 CameraFollowLastRequested;
         private static bool CameraFollowHasLastRequested;
         private static bool HasCameraNudge = false;
@@ -140,6 +140,10 @@ namespace SnowFlyer2
         private const int CameraSourceTransformOffset = 0x08;
         private const int CameraSourceControllerOffset = 0x18;
         private const int CameraSourceControllerTransformOffset = 0x08;
+        private const int FollowTargetBasisOffset = 0x170;
+        // Basis vectors at +0x170/+0x180/+0x190 and position at +0x1A0
+        // share one 16-byte-strided snapshot.
+        private const int FollowTargetBasisSize = 0x40;
         private const int CameraSourceMatrixSize = 0x40;
         private const int CameraSourceWorldPositionOffset = 0xB0;
         private const int CameraSourceTranslationOffset = 0x30;
@@ -148,6 +152,7 @@ namespace SnowFlyer2
         private const float CameraSourceHeightNudge = 1.0f;
         private const float CameraSourcePositionTolerance = 0.1f;
         private const float CameraSourceBasisTolerance = 0.02f;
+        private const float FollowTargetBasisTolerance = 0.02f;
         private const float CameraSourceMatrixGuardTolerance = 0.001f;
         private const float CameraFollowNoiseThreshold = 0.001f;
         private const float CameraFollowMaxIncrement = 50.0f;
@@ -587,7 +592,9 @@ namespace SnowFlyer2
 
                     CameraSourceSnapshot source;
                     Vector3 playerPosition;
-                    if (!TryReadFollowPlayerPosition(processHandle, playerCoordsBasePtr, out playerPosition) ||
+                    float[] targetBasis;
+                    if (!TryReadFollowPlayerState(processHandle, playerCoordsBasePtr,
+                            out playerPosition, out targetBasis) ||
                         !TryReadCameraSourceSnapshot(processHandle, snowRunnerProcess.MainModule.BaseAddress,
                             true, true, out source))
                     {
@@ -596,7 +603,7 @@ namespace SnowFlyer2
                     }
 
                     CameraFollowOffset = source.WorldPosition - playerPosition;
-                    CameraFollowTransform = source.Transform;
+                    CameraFollowLocalOffset = WorldOffsetToLocal(CameraFollowOffset, targetBasis);
                     CameraFollowLastRequested = source.WorldPosition;
                     CameraFollowHasLastRequested = true;
                     IsFollowingPlayer = true;
@@ -741,7 +748,9 @@ namespace SnowFlyer2
 
                         CameraSourceSnapshot source;
                         Vector3 playerPosition;
-                        if (!TryReadFollowPlayerPosition(processHandle, playerCoordsBasePtr, out playerPosition) ||
+                        float[] targetBasis;
+                        if (!TryReadFollowPlayerState(processHandle, playerCoordsBasePtr,
+                                out playerPosition, out targetBasis) ||
                             !TryReadCameraSourceSnapshot(processHandle, moduleBase, false, false, out source))
                         {
                             failure = "Camera follow could not resolve the current game state.";
@@ -764,9 +773,10 @@ namespace SnowFlyer2
                                 if (residualLength > CameraFollowMaxIncrement)
                                     failure = "Native camera movement exceeded the per-frame follow bound.";
                                 else if (residualLength > CameraFollowNoiseThreshold)
-                                    CameraFollowOffset += residual;
+                                    CameraFollowLocalOffset += WorldOffsetToLocal(residual, targetBasis);
                             }
 
+                            CameraFollowOffset = LocalOffsetToWorld(CameraFollowLocalOffset, targetBasis);
                             Vector3 targetPosition = playerPosition + CameraFollowOffset;
                             Vector3 increment = targetPosition - source.WorldPosition;
                             if (failure == null && increment.Length() > CameraFollowMaxIncrement)
@@ -1352,10 +1362,12 @@ namespace SnowFlyer2
             }
         }
 
-        private static bool TryReadFollowPlayerPosition(
-            IntPtr processHandle, IntPtr playerCoordsBasePtr, out Vector3 playerPosition)
+        private static bool TryReadFollowPlayerState(
+            IntPtr processHandle, IntPtr playerCoordsBasePtr,
+            out Vector3 playerPosition, out float[] targetBasis)
         {
             playerPosition = default;
+            targetBasis = null;
             if (playerCoordsBasePtr == IntPtr.Zero ||
                 !TryReadPointer(processHandle, playerCoordsBasePtr, out long rootValue) ||
                 !IsValidCameraPointer(rootValue) ||
@@ -1367,18 +1379,64 @@ namespace SnowFlyer2
                 !IsValidCameraPointer(secondValue))
                 return false;
 
-            byte[] bytes = new byte[12];
+            byte[] basisBytes = new byte[FollowTargetBasisSize];
             if (!TryReadBytes(processHandle,
-                new IntPtr(secondValue + 0x1A0), bytes))
+                    new IntPtr(secondValue + FollowTargetBasisOffset), basisBytes))
+                return false;
+            // The three basis vectors are 16-byte aligned, with one padding/
+            // auxiliary float after each vector.  Do not treat this as a
+            // tightly packed 3x3 matrix.
+            float[] stridedBasis = new float[16];
+            for (int index = 0; index < stridedBasis.Length; index++)
+                stridedBasis[index] = BitConverter.ToSingle(basisBytes, index * 4);
+            targetBasis = new float[9]
+            {
+                stridedBasis[0], stridedBasis[1], stridedBasis[2],
+                stridedBasis[4], stridedBasis[5], stridedBasis[6],
+                stridedBasis[8], stridedBasis[9], stridedBasis[10]
+            };
+            if (!IsValidFollowTargetBasis(targetBasis))
                 return false;
             Vector3 stored = new Vector3(
-                BitConverter.ToSingle(bytes, 0),
-                BitConverter.ToSingle(bytes, 4),
-                BitConverter.ToSingle(bytes, 8));
+                stridedBasis[12], stridedBasis[13], stridedBasis[14]);
             if (!IsFiniteVector(stored))
                 return false;
             playerPosition = StoredZyxToWorld(stored);
             return IsFiniteVector(playerPosition);
+        }
+
+        private static bool IsValidFollowTargetBasis(float[] basis)
+        {
+            if (basis == null || basis.Length != 9 || basis.Any(value => !IsFiniteFloat(value)))
+                return false;
+            Vector3 row0 = new Vector3(basis[0], basis[1], basis[2]);
+            Vector3 row1 = new Vector3(basis[3], basis[4], basis[5]);
+            Vector3 row2 = new Vector3(basis[6], basis[7], basis[8]);
+            return Math.Abs(row0.Length() - 1.0f) <= FollowTargetBasisTolerance &&
+                   Math.Abs(row1.Length() - 1.0f) <= FollowTargetBasisTolerance &&
+                   Math.Abs(row2.Length() - 1.0f) <= FollowTargetBasisTolerance &&
+                   Math.Abs(Vector3.Dot(row0, row1)) <= FollowTargetBasisTolerance &&
+                   Math.Abs(Vector3.Dot(row0, row2)) <= FollowTargetBasisTolerance &&
+                   Math.Abs(Vector3.Dot(row1, row2)) <= FollowTargetBasisTolerance;
+        }
+
+        private static Vector3 WorldOffsetToLocal(Vector3 worldOffset, float[] basis)
+        {
+            Vector3 stored = new Vector3(worldOffset.Z, worldOffset.Y, worldOffset.X);
+            Vector3 row0 = new Vector3(basis[0], basis[1], basis[2]);
+            Vector3 row1 = new Vector3(basis[3], basis[4], basis[5]);
+            Vector3 row2 = new Vector3(basis[6], basis[7], basis[8]);
+            return new Vector3(Vector3.Dot(stored, row0),
+                Vector3.Dot(stored, row1), Vector3.Dot(stored, row2));
+        }
+
+        private static Vector3 LocalOffsetToWorld(Vector3 localOffset, float[] basis)
+        {
+            Vector3 row0 = new Vector3(basis[0], basis[1], basis[2]);
+            Vector3 row1 = new Vector3(basis[3], basis[4], basis[5]);
+            Vector3 row2 = new Vector3(basis[6], basis[7], basis[8]);
+            Vector3 stored = row0 * localOffset.X + row1 * localOffset.Y + row2 * localOffset.Z;
+            return new Vector3(stored.Z, stored.Y, stored.X);
         }
 
         private static bool TryReadPlayerCoords(Process snowRunnerProcess, out Vector3 playerVector)

@@ -32,7 +32,8 @@ This branch adds a first reverse-engineering aid for the spectator project:
 - `Ctrl+F10` starts or stops read-only rendered camera position tracking.
 - `Ctrl+F11` dumps the rendered camera transform and its nearby basis candidates.
 - `Ctrl+F12` starts or stops validated camera follow. Enable freecam first; the
-  camera keeps its current offset from the active vehicle/player anchor.
+  camera keeps its current offset from the active vehicle/player anchor and
+  rotates that offset with the vehicle as it steers.
 - `Ctrl+Shift+F12` performs a reversible one-unit camera-height nudge for
   diagnostics.
 
@@ -84,7 +85,8 @@ The validated source is `SnowRunner.exe+0x2A8EB90 -> [owner+0x08]`. Follow reads
 the active anchor from `SnowRunner.exe+0x2A8EB68 -> [root+0x28] -> [object+0x18]
 -> object+0x1A0` (stored Z,Y,X), then writes only the source matrix translation.
 The current runtime validation follows the active truck/player anchor while the
-vehicle moves; multiplayer and selecting a different vehicle are not yet exposed.
+vehicle moves and turns; multiplayer and selecting a different vehicle are not
+yet exposed.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
