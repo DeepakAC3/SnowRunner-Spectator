@@ -237,6 +237,7 @@ namespace SnowFlyer2
         private const float CameraFollowTranslationBasisGuardTolerance = 0.02f;
         private const float CameraFollowTranslationPositionGuardTolerance = 0.20f;
         private const float CameraSourceReadbackBasisTolerance = 0.00005f;
+        private const float CameraSourceReadbackBasisRaceRetryLimit = 0.01f;
         private const float CameraSourceReadbackTranslationResidualTolerance = CameraSourcePositionTolerance;
         private const float CameraSourceReadbackPositionTolerance = CameraSourcePositionTolerance;
         private const float CameraOrbitAngularSpeed = 1.8f;
@@ -1928,7 +1929,7 @@ namespace SnowFlyer2
                                         CameraFollowDiagnosticReason);
                                     skipTick = true;
                                     if (matrixGuardMismatchCount >= CameraFollowMaxMatrixGuardSkips)
-                                        failure = "Camera source matrix changed repeatedly before look-at write.";
+                                        failure = "Camera source matrix changed repeatedly during guarded look-at writes.";
                                 }
                                 else
                                 {
@@ -2186,6 +2187,7 @@ namespace SnowFlyer2
             bool readbackAvailable = wrote &&
                 TryReadBytes(processHandle, new IntPtr(transform.ToInt64()), readback);
             bool readBackExactly = readbackAvailable && readback.SequenceEqual(matrix);
+            bool coherentBasisRace = false;
             if (readbackAvailable && !readBackExactly)
             {
                 if (TryAcceptSmallMatrixReadbackDelta(matrix, readback,
@@ -2209,6 +2211,10 @@ namespace SnowFlyer2
                         out float measuredBasisDelta, out float measuredTranslationResidual,
                         out float measuredRawTranslationDelta,
                         out float measuredPositionDelta, out float measuredDeterminant);
+                    // A coherent game-side rotation can exceed the strict success
+                    // tolerance. It remains a failed write; retry only after the
+                    // original bytes and invalidated caches have been verified.
+                    coherentBasisRace = IsRetryableMatrixBasisRace(matrix, readback);
                     Console.WriteLine($"Camera source matrix readback mismatch: " +
                         $"basis {measuredBasisDelta:F7}, raw translation {measuredRawTranslationDelta:F7}, " +
                         $"coherent residual {measuredTranslationResidual:F7}, " +
@@ -2229,7 +2235,37 @@ namespace SnowFlyer2
             bool rollbackCaches = TryInvalidateSourceCaches(processHandle, transform);
             if (!rollbackWrite || !rollbackRead || !rollbackCaches)
                 Console.WriteLine("Camera source matrix write failed and byte-exact rollback verification failed.");
+            else if (coherentBasisRace)
+            {
+                // Reuse the caller's bounded guard-skip counter. Never classify
+                // partial writes, incoherent matrices, or failed rollback as races.
+                byte[] cacheA = new byte[4];
+                byte[] cacheB = new byte[4];
+                guardMismatch =
+                    TryReadBytes(processHandle,
+                        new IntPtr(transform.ToInt64() + CameraSourceCacheFlagOffsetA), cacheA) &&
+                    TryReadBytes(processHandle,
+                        new IntPtr(transform.ToInt64() + CameraSourceCacheFlagOffsetB), cacheB) &&
+                    BitConverter.ToInt32(cacheA, 0) == -1 &&
+                    BitConverter.ToInt32(cacheB, 0) == -1;
+            }
             return false;
+        }
+
+        private static bool IsRetryableMatrixBasisRace(byte[] expected, byte[] actual)
+        {
+            TryMeasureMatrixReadbackDelta(expected, actual,
+                out float basisDelta, out float translationResidual,
+                out _, out float positionDelta, out float actualDeterminant);
+            return IsFiniteFloat(basisDelta) &&
+                basisDelta > CameraSourceReadbackBasisTolerance &&
+                basisDelta < CameraSourceReadbackBasisRaceRetryLimit &&
+                IsFiniteFloat(translationResidual) &&
+                translationResidual <= CameraSourceReadbackTranslationResidualTolerance &&
+                IsFiniteFloat(positionDelta) &&
+                positionDelta <= CameraSourceReadbackPositionTolerance &&
+                IsFiniteFloat(actualDeterminant) && actualDeterminant > 0.25f &&
+                TryReconstructSourcePosition(MatrixFloats(actual), out _);
         }
 
         private static bool TryAcceptSmallMatrixReadbackDelta(byte[] expected,

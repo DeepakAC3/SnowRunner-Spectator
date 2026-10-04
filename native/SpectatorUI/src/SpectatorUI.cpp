@@ -154,6 +154,7 @@ float g_uiDistance = 12.0f;
 float g_uiHeight = 3.0f;
 float g_uiSmoothing = 120.0f;
 uint64_t g_uiSelectedOwner = 0;
+uint64_t g_uiAuthoritativeOwner = 0;
 
 LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 HRESULT __stdcall HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags);
@@ -506,7 +507,7 @@ void CopyState(State& state)
 const char* CurrentAsset(const State& state)
 {
     for (const Target& target : state.targets)
-        if (target.owner == state.selectedOwner || target.owner == g_uiSelectedOwner)
+        if (target.owner == state.selectedOwner)
             return target.asset.empty() ? "truck" : target.asset.c_str();
     return "truck";
 }
@@ -538,11 +539,21 @@ void DrawHud(const State& state)
 
 void DrawMenu(State state)
 {
-    // Reconnects and helper-side hotkeys can change the authoritative mode
-    // while the menu is hidden. Reconcile the local widgets before drawing so
-    // a reopened menu never presents stale checkboxes or a stale selection.
-    if (state.selectedOwner != 0)
+    // Keep the pending truck choice until Spectate is pressed. Reconcile it
+    // only when the helper's selection changes, including changes while hidden.
+    if (state.selectedOwner != g_uiAuthoritativeOwner)
+    {
+        g_uiAuthoritativeOwner = state.selectedOwner;
         g_uiSelectedOwner = state.selectedOwner;
+    }
+    const auto hasTarget = [&state](uint64_t owner)
+    {
+        return owner != 0 && std::any_of(state.targets.begin(), state.targets.end(),
+            [owner](const Target& target) { return target.owner == owner; });
+    };
+    if (!hasTarget(g_uiSelectedOwner))
+        g_uiSelectedOwner = hasTarget(state.selectedOwner) ? state.selectedOwner :
+            (state.targets.empty() ? 0 : state.targets.front().owner);
     g_uiFace = (state.flags & kFace) != 0;
     g_uiOrbit = (state.flags & kOrbit) != 0;
     ImGuiViewport* viewport = ImGui::GetMainViewport();

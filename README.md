@@ -182,7 +182,21 @@ the maximum rendered position step was 0.000309 m and follow remained active.
 This verifies the rotation case that previously left the camera approximately
 270 m from the truck. The separate 15-second user-drive capture contained no
 truck movement, so it does not verify moving follow with this build. Native UI
-rendering and interactions still require live verification after compilation.
+rendering and interactions were verified separately in the later session below.
+
+The in-game DirectX11 ImGui menu was loaded into SnowRunner on 2026-10-04.
+The native log confirmed hook installation, renderer initialization, and helper
+pipe connection. The menu displayed all three validated trucks, and the user
+successfully selected and spectated the CK1500. During the following drive with
+Face truck and Orbit off, the truck moved approximately 61 m from its starting
+position and follow continued without logged stops or write failures. This is
+evidence for that session, not a guarantee against all intermittent failures.
+
+A later Face truck + Orbit drive stopped after a coherent rotation readback
+race: basis delta 0.0021316, reconstructed position delta 0.0002 m. Release15
+keeps the strict success tolerance and retries bounded coherent rotations only
+after byte-exact rollback and cache invalidation readback succeed. Seven pure
+matrix regression checks passed; the repeat in-game test is pending.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
