@@ -12,11 +12,13 @@ namespace SnowFlyer2
         public IntPtr Address { get; set; }
         public Vector3Display Position { get; set; }
         public bool IsActive { get; set; }
+        public string Name { get; set; }
 
         public override string ToString()
         {
             string marker = IsActive ? " [active]" : string.Empty;
-            return $"{Position.X,8:F1} {Position.Y,7:F1} {Position.Z,8:F1}   0x{Address.ToInt64():X}{marker}";
+            string label = string.IsNullOrWhiteSpace(Name) ? "transform candidate" : Name;
+            return $"{label,-34} {Position.X,8:F1} {Position.Y,7:F1} {Position.Z,8:F1}   0x{Address.ToInt64():X}{marker}";
         }
     }
 
@@ -70,7 +72,7 @@ namespace SnowFlyer2
 
             Label title = new Label
             {
-                Text = "Spectator targets (world position)",
+                Text = "Spectator targets (asset name / world position)",
                 AutoSize = false,
                 TextAlign = ContentAlignment.MiddleLeft,
                 Dock = DockStyle.Top,

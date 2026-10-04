@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using System.Numerics;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace SnowFlyer2
 {
@@ -838,7 +839,8 @@ namespace SnowFlyer2
                     {
                         Address = candidate,
                         Position = new Vector3Display(position.X, position.Y, position.Z),
-                        IsActive = candidate == activeObject
+                        IsActive = candidate == activeObject,
+                        Name = TryDescribeFollowTarget(processHandle, candidate)
                     });
                 }
                 results.Sort((left, right) =>
@@ -856,6 +858,140 @@ namespace SnowFlyer2
                 CloseHandle(processHandle);
             }
             return results;
+        }
+
+        private static string TryDescribeFollowTarget(IntPtr processHandle, IntPtr candidate)
+        {
+            var queue = new Queue<Tuple<IntPtr, int>>();
+            var seen = new HashSet<IntPtr>();
+            queue.Enqueue(Tuple.Create(candidate, 0));
+            string bestName = null;
+            int bestScore = 0;
+
+            while (queue.Count > 0 && seen.Count < 48)
+            {
+                Tuple<IntPtr, int> item = queue.Dequeue();
+                IntPtr address = item.Item1;
+                int depth = item.Item2;
+                if (!IsValidCameraPointer(address.ToInt64()) || !seen.Add(address))
+                    continue;
+
+                int readSize = depth == 0 ? 0x220 : 0x1000;
+                if (!TryReadBytes(processHandle, address, out byte[] bytes, readSize))
+                    continue;
+
+                if (TryExtractVehicleAssetName(bytes, out string name, out int score) &&
+                    score > bestScore)
+                {
+                    bestName = name;
+                    bestScore = score;
+                }
+
+                if (depth >= 2)
+                    continue;
+                int pointerLimit = Math.Min(bytes.Length, depth == 0 ? 0x220 : 0x400);
+                for (int offset = 0; offset + 8 <= pointerLimit; offset += 8)
+                {
+                    long value = BitConverter.ToInt64(bytes, offset);
+                    if (IsValidCameraPointer(value))
+                        queue.Enqueue(Tuple.Create(new IntPtr(value), depth + 1));
+                }
+            }
+            return bestName;
+        }
+
+        private static bool TryExtractVehicleAssetName(
+            byte[] bytes, out string name, out int score)
+        {
+            name = null;
+            score = 0;
+            if (bytes == null || bytes.Length < 8)
+                return false;
+
+            string[] texts =
+            {
+                Encoding.ASCII.GetString(bytes),
+                Encoding.Unicode.GetString(bytes)
+            };
+            foreach (string text in texts)
+            {
+                string[] segments = text.Split('\0');
+                foreach (string segment in segments)
+                {
+                    if (segment.Length < 5)
+                        continue;
+                    string candidateName;
+                    int candidateScore;
+                    if (!TryNormalizeVehicleAssetName(segment,
+                            out candidateName, out candidateScore))
+                        continue;
+                    if (candidateScore > score)
+                    {
+                        name = candidateName;
+                        score = candidateScore;
+                    }
+                }
+            }
+            return name != null;
+        }
+
+        private static bool TryNormalizeVehicleAssetName(
+            string text, out string name, out int score)
+        {
+            name = null;
+            score = 0;
+            string lower = text.ToLowerInvariant();
+            string[] friendlyNames =
+            {
+                "international_fleetstar_f2070a|Fleetstar F2070A",
+                "chevrolet_ck1500|Chevrolet CK1500",
+                "western_star_49x|Western Star 49X",
+                "white_western_star_4964|Western Star 4964",
+                "pacific_p12|Pacific P12",
+                "pacific_p16|Pacific P16",
+                "azov_64131|Azov 64131",
+                "tayga_6436|Tayga 6436",
+                "ank_mk38|ANK MK38",
+                "don_71|DON 71",
+                "khan_39_marshall|KHAN 39 Marshall"
+            };
+            foreach (string entry in friendlyNames)
+            {
+                string[] pair = entry.Split('|');
+                if (lower.IndexOf(pair[0], StringComparison.Ordinal) >= 0)
+                {
+                    name = pair[1];
+                    score = 40;
+                    return true;
+                }
+            }
+
+            int marker = lower.IndexOf("classes\\trucks\\", StringComparison.Ordinal);
+            int markerLength = "classes\\trucks\\".Length;
+            if (marker < 0)
+            {
+                marker = lower.IndexOf("classes/trucks/", StringComparison.Ordinal);
+                markerLength = "classes/trucks/".Length;
+            }
+            if (marker < 0)
+            {
+                marker = lower.IndexOf("trailer_", StringComparison.Ordinal);
+                markerLength = 0;
+            }
+            if (marker < 0)
+                return false;
+
+            string candidate = text.Substring(marker + markerLength).Trim();
+            int end = candidate.IndexOfAny(new[] { '\\', '/', '"', '\'', ' ', '\r', '\n' });
+            if (end >= 0)
+                candidate = candidate.Substring(0, end);
+            if (candidate.Length < 4)
+                return false;
+            if (candidate.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                candidate = candidate.Substring(0, candidate.Length - 4);
+            name = candidate;
+            score = 20;
+            return true;
         }
 
         private static bool TryReadBytes(IntPtr processHandle, IntPtr address,

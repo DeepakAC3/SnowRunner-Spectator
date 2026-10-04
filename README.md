@@ -37,9 +37,9 @@ This branch adds a first reverse-engineering aid for the spectator project:
 - `Ctrl+Shift+F12` performs a reversible one-unit camera-height nudge for
   diagnostics.
 - `Ctrl+Shift+F11` opens a spectator overlay. It lists validated transform
-  candidates, lets you select one without entering it, and attaches follow to
-  the selected object. The first version displays positions and addresses while
-  vehicle-name mapping is still being traced.
+  candidates, tries to label them from their truck/trailer asset paths, lets
+  you select one without entering it, and attaches follow to the selected
+  object. Unresolved entries remain labeled as transform candidates.
 
 When SnowRunner is the foreground window and freecam is active, the helper
 watches the `M`/`Esc` map boundary: it stops follow, disables freecam, and

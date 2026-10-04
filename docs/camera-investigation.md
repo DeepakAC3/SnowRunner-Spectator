@@ -21,8 +21,9 @@ The live evidence is saved locally in ignored `logs/camera-nudge.json`. Other ca
 The writable source and follow loop are now implemented. The target overlay
 scans the active transform allocation, lists nonzero transform candidates, and
 passes a selected object directly into the guarded follow loop. It is currently
-position/address based; mapping each candidate to the map's truck name remains
-an investigation item. A foreground-gated map-transition watcher polls
+position/address based; the scanner now also follows a bounded set of body
+pointers to recover truck/trailer asset IDs when they are present. A complete
+map-name mapping remains an investigation item. A foreground-gated map-transition watcher polls
 SnowRunner's `M` and `Esc` boundaries, stops follow, disables freecam at the map
 boundary, and restores freecam after the world view returns. The guard is
 best-effort because it polls the key state while the game handles the same key.
