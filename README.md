@@ -225,7 +225,12 @@ the log confirms follow selected the Fleetstar owner. A later stop at 15:08:50
 was caused by the unrelated active-player identity chain becoming unavailable.
 The follow worker now retains validated type tables from attachment and checks
 the selected truck directly on each tick. Selected-truck identity and camera
-write guards remain mandatory. Live verification of this latest fix is pending.
+write guards remain mandatory. The updated helper then followed a stationary
+Fleetstar for 157 seconds (158 logged samples) with Face truck off and no logged
+follow stops. A 40-pixel held right-mouse drag changed its offset, which remained
+unchanged after release. Source and target positions matched at the log's
+0.01 m resolution. This verifies stationary follow and gesture release for that
+run; active-player read failure was not fault injected.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
