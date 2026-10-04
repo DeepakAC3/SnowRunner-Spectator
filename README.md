@@ -161,10 +161,12 @@ drag and XInput right-stick gestures directly to follow. The helper and native
 menu build successfully and passed source review. After restarting SnowRunner,
 the updated menu loaded and listed three trucks.
 The user verified that held right-mouse drag moves around the truck and follow
-continues after release. Physical controller verification remains pending; no
-controller was connected during preparation. With Face truck off, right-stick
-input also reaches the
-game's native camera rotation.
+continues after release. The user also verified right-stick control and driving
+with Face truck disabled. A log capture with Face truck off contained 112 samples
+and approximately 142 m of travel, with no logged follow stops and a maximum
+sampled source-to-target position difference of 0.091 m. Right-stick input also
+reaches the game's native camera rotation when Face truck is off; the user
+reported this run worked correctly.
 
 Release4 found the same three distinct truck chassis and visually attached to
 the inactive Fleetstar without entering it. During a 7.29 m CK1500 drive over
