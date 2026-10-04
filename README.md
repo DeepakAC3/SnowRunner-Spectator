@@ -78,6 +78,7 @@ WinForms window positioned over the SnowRunner viewport.
 ## TODO
 
 - Record and replay camera paths.
+- Add an in-game FOV slider after validating the freecam FOV source.
 
 Use the tracker in single-player first. It should print lines in this form while
 you drive:
