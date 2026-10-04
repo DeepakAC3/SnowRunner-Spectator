@@ -105,8 +105,13 @@ namespace SnowFlyer2
         private static int CameraFollowGeneration;
         private static Vector3 CameraFollowLastRequested;
         private static bool CameraFollowHasLastRequested;
-        private static IntPtr SelectedFollowTargetObject;
+        private static IntPtr SelectedFollowOwner;
+        private static IntPtr SelectedFollowAction;
+        private static IntPtr SelectedFollowBody;
+        private static IntPtr SelectedFollowFrame;
+        private static string SelectedFollowAssetId;
         private static TargetOverlayForm TargetOverlay;
+        private static readonly object TargetScanGate = new object();
         private static bool HasCameraNudge = false;
         private static IntPtr CameraNudgeTransform;
         private static byte[] CameraNudgeOriginalTranslation;
@@ -127,6 +132,12 @@ namespace SnowFlyer2
         private const uint PageGuard = 0x100;
         private const uint PageNoAccess = 0x01;
         private const uint MemPrivate = 0x20000;
+        private const uint PageReadOnly = 0x02;
+        private const uint PageReadWrite = 0x04;
+        private const uint PageWriteCopy = 0x08;
+        private const uint PageExecuteRead = 0x20;
+        private const uint PageExecuteReadWrite = 0x40;
+        private const uint PageExecuteWriteCopy = 0x80;
         private const int CameraScanRadius = 300;
         private const int CameraScanVerticalRadius = 100;
         private const int CameraScanChunkSize = 1024 * 1024;
@@ -148,12 +159,25 @@ namespace SnowFlyer2
         private const int CameraSourceTransformOffset = 0x08;
         private const int CameraSourceControllerOffset = 0x18;
         private const int CameraSourceControllerTransformOffset = 0x08;
-        private const int FollowTargetBasisOffset = 0x170;
-        // Basis vectors at +0x170/+0x180/+0x190 and position at +0x1A0
-        // share one 16-byte-strided snapshot.
-        private const int FollowTargetBasisSize = 0x40;
-        private const int FollowTargetScanAlignment = 0x10;
-        private const int FollowTargetScanRadius = 0x1000000;
+        private const int FollowTargetScanAlignment = 0x08;
+        private const int FollowTargetScanChunkSize = 1024 * 1024;
+        private const long FollowTargetScanMaxBytes = 8L * 1024 * 1024 * 1024;
+        private const int FollowTargetScanMaxMilliseconds = 40000;
+        private const int FollowTargetMaxAssetLength = 160;
+        private const int FollowTargetTransformSize = 0x40;
+        private const int FollowTargetNodeTransformOffset = 0x50;
+        private const int FollowTargetBodyTransformOffset = 0x170;
+        private const int FollowTargetActionOwnerOffset = 0x30;
+        private const int FollowTargetOwnerActionOffset = 0x68;
+        private const int FollowTargetOwnerBodyOffset = 0x5D0;
+        private const int FollowTargetOwnerModelOffset = 0x60;
+        private const int FollowTargetModelResourceOffset = 0x60;
+        private const int FollowTargetResourceAssetOffset = 0x10;
+        private const int FollowTargetResourceDefinitionOffset = 0x50;
+        private const int FollowTargetOwnerNodeOffset = 0x2A0;
+        private const int FollowTargetNodeDefinitionOffset = 0x00;
+        private const int FollowTargetNodeModelOffset = 0xD0;
+        private const int FollowTargetNodeSelfOffset = 0xE8;
         private const int CameraSourceMatrixSize = 0x40;
         private const int CameraSourceWorldPositionOffset = 0xB0;
         private const int CameraSourceTranslationOffset = 0x30;
@@ -240,6 +264,21 @@ namespace SnowFlyer2
             public Vector3 WorldPosition;
             public Vector3 CachedZyx;
             public Vector3 RenderedZyx;
+        }
+
+        private sealed class TruckTargetSnapshot
+        {
+            public IntPtr Owner;
+            public IntPtr Action;
+            public IntPtr ChassisBody;
+            public IntPtr Frame;
+            public IntPtr ActionVtable;
+            public IntPtr ChassisVtable;
+            public string AssetId;
+            public string BoneName;
+            public Vector3 Position;
+            public float[] Basis;
+            public bool IsActive;
         }
 
         [STAThread]
@@ -603,39 +642,53 @@ namespace SnowFlyer2
                 {
                     if (IsFollowingPlayer)
                         return;
-                    IntPtr targetObject = SelectedFollowTargetObject;
-                    if (!IsValidCameraPointer(targetObject.ToInt64()) &&
-                        (!TryResolveFollowPlayerSingleton(snowRunnerProcess,
-                            out IntPtr playerCoordsBasePtr) ||
-                         !TryResolveFollowTargetObject(processHandle, playerCoordsBasePtr,
-                            out targetObject)))
+                    if (!TryReadTruckScanIdentity(processHandle,
+                            snowRunnerProcess.MainModule.BaseAddress,
+                            out IntPtr activeOwner, out IntPtr actionVtable,
+                            out IntPtr chassisVtable))
                     {
                         Console.WriteLine("No valid spectator target could be resolved for follow mode.");
                         return;
                     }
 
+                    IntPtr owner = SelectedFollowOwner;
+                    if (!IsValidCameraPointer(owner.ToInt64()))
+                        owner = activeOwner;
+                    if (!TryReadValidatedTruckOwner(processHandle, owner,
+                            actionVtable, chassisVtable, activeOwner,
+                            out TruckTargetSnapshot target))
+                    {
+                        Console.WriteLine("Selected target is no longer a validated truck chassis; follow refused.");
+                        return;
+                    }
+                    if (IsValidCameraPointer(SelectedFollowOwner.ToInt64()) &&
+                        !MatchesSelectedTruck(target))
+                    {
+                        Console.WriteLine("Selected truck identity changed; follow refused.");
+                        return;
+                    }
+
                     CameraSourceSnapshot source;
-                    Vector3 playerPosition;
-                    float[] targetBasis;
-                    if (!TryReadFollowTargetState(processHandle, targetObject,
-                            out playerPosition, out targetBasis) ||
-                        !TryReadCameraSourceSnapshot(processHandle, snowRunnerProcess.MainModule.BaseAddress,
+                    if (!TryReadCameraSourceSnapshot(processHandle,
+                            snowRunnerProcess.MainModule.BaseAddress,
                             true, true, out source))
                     {
                         Console.WriteLine("Validated source camera state could not be read for follow mode.");
                         return;
                     }
 
-                    CameraFollowOffset = source.WorldPosition - playerPosition;
-                    CameraFollowLocalOffset = WorldOffsetToLocal(CameraFollowOffset, targetBasis);
+                    CameraFollowOffset = source.WorldPosition - target.Position;
+                    CameraFollowLocalOffset = WorldOffsetToLocal(CameraFollowOffset, target.Basis);
                     CameraFollowLastRequested = source.WorldPosition;
                     CameraFollowHasLastRequested = true;
                     IsFollowingPlayer = true;
 
                     int generation = ++CameraFollowGeneration;
-                    Console.WriteLine($"Camera follow started with offset {CameraFollowOffset.X:F2} " +
+                    Console.WriteLine($"Camera follow started on {target.AssetId} with offset {CameraFollowOffset.X:F2} " +
                         $"{CameraFollowOffset.Y:F2} {CameraFollowOffset.Z:F2}.");
-                    Task.Run(() => TrackCameraFollow(snowRunnerProcess, targetObject,
+                    Task.Run(() => TrackCameraFollow(snowRunnerProcess, owner,
+                        target.Action, target.ChassisBody, target.Frame,
+                        target.AssetId,
                         snowRunnerProcess.MainModule.BaseAddress, source.Transform, generation));
                 }
             }
@@ -659,13 +712,9 @@ namespace SnowFlyer2
             }
 
             TargetOverlay = new TargetOverlayForm(
-                () => ScanFollowTargetCandidates(snowRunnerProcess),
+                () => ScanValidatedTruckTargets(snowRunnerProcess),
                 SelectFollowTarget,
-                () =>
-                {
-                    ToggleCameraFollow(snowRunnerProcess);
-                    return IsFollowingPlayer ? "Camera follow is active." : "Camera follow is stopped.";
-                },
+                () => AttachSelectedTruck(snowRunnerProcess),
                 snowRunnerProcess.MainWindowHandle);
             TargetOverlay.FormClosed += (sender, args) => TargetOverlay = null;
             TargetOverlay.Show();
@@ -683,10 +732,111 @@ namespace SnowFlyer2
                     CameraFollowGeneration++;
                     Console.WriteLine("Camera follow stopped before changing target.");
                 }
-                SelectedFollowTargetObject = target.Address;
+                SelectedFollowOwner = target.OwnerAddress;
+                SelectedFollowAction = target.ActionAddress;
+                SelectedFollowBody = target.ChassisBodyAddress;
+                SelectedFollowFrame = target.FrameAddress;
+                SelectedFollowAssetId = target.AssetId;
             }
-            Console.WriteLine($"Selected spectator target {target.Address.ToInt64():X} at " +
+            Console.WriteLine($"Selected truck chassis {target.AssetId} {target.Address.ToInt64():X} at " +
                 $"{target.Position.X:F2} {target.Position.Y:F2} {target.Position.Z:F2}.");
+        }
+
+        private static bool MatchesSelectedTruck(TruckTargetSnapshot target)
+        {
+            return target != null &&
+                target.Owner == SelectedFollowOwner &&
+                target.Action == SelectedFollowAction &&
+                target.ChassisBody == SelectedFollowBody &&
+                target.Frame == SelectedFollowFrame &&
+                string.Equals(target.AssetId, SelectedFollowAssetId,
+                    StringComparison.Ordinal);
+        }
+
+        private static string AttachSelectedTruck(Process snowRunnerProcess)
+        {
+            IntPtr processHandle = OpenProcess(
+                ProcessQueryInformation | ProcessVmRead | ProcessVmWrite | ProcessVmOperation,
+                false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+                return "Could not open SnowRunner for truck attach.";
+
+            try
+            {
+                IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
+                lock (CameraWriteGate)
+                {
+                    if (!TryReadTruckScanIdentity(processHandle, moduleBase,
+                            out IntPtr activeOwner, out IntPtr actionVtable,
+                            out IntPtr chassisVtable))
+                        return "Active truck identity is unavailable; attach refused.";
+                    if (!IsValidCameraPointer(SelectedFollowOwner.ToInt64()))
+                        return "Select a validated truck chassis first.";
+                    if (!TryReadValidatedTruckOwner(processHandle, SelectedFollowOwner,
+                            actionVtable, chassisVtable, activeOwner,
+                            out TruckTargetSnapshot target))
+                        return "Selected truck identity changed; refresh and select it again.";
+                    if (!MatchesSelectedTruck(target))
+                        return "Selected truck identity changed; refresh and select it again.";
+
+                    if (!IsFreeCamActive && !EnableFreeCam(snowRunnerProcess))
+                        return "Freecam could not be enabled; attach refused.";
+
+                    CameraSourceSnapshot source;
+                    CameraSourceSnapshot prewrite;
+                    if (!TryReadCameraSourceSnapshot(processHandle, moduleBase,
+                            true, true, out source) ||
+                        !TryReadCameraSourceSnapshot(processHandle, moduleBase,
+                            true, true, out prewrite) ||
+                        MaxAbsDifference(source.Matrix, prewrite.Matrix) >
+                            CameraSourceMatrixGuardTolerance)
+                        return "Validated source camera state changed during attach guard.";
+                    source = prewrite;
+
+                    if (!TryReadValidatedTruckOwner(processHandle, SelectedFollowOwner,
+                            actionVtable, chassisVtable, activeOwner,
+                            out target))
+                        return "Selected truck identity changed during attach guard.";
+                    if (!MatchesSelectedTruck(target))
+                        return "Selected truck identity changed during attach guard.";
+
+                    Vector3 forward = new Vector3(source.Matrix[10],
+                        source.Matrix[6], source.Matrix[2]);
+                    if (!IsFiniteVector(forward) || forward.LengthSquared() < 0.25f)
+                        return "Camera forward vector is invalid; attach refused.";
+                    forward = Vector3.Normalize(forward);
+                    Vector3 attachPosition = target.Position +
+                        new Vector3(0.0f, 2.0f, 0.0f) - forward * 12.0f;
+                    if (!TryWriteSourceTranslation(processHandle, source.Transform,
+                            BuildTranslationBytes(source.Matrix, attachPosition)))
+                        return "Attach recenter write failed validation.";
+
+                    if (IsFollowingPlayer)
+                    {
+                        IsFollowingPlayer = false;
+                        CameraFollowGeneration++;
+                    }
+                    CameraFollowOffset = attachPosition - target.Position;
+                    CameraFollowLocalOffset = WorldOffsetToLocal(CameraFollowOffset,
+                        target.Basis);
+                    CameraFollowLastRequested = attachPosition;
+                    CameraFollowHasLastRequested = true;
+                    IsFollowingPlayer = true;
+                    int generation = ++CameraFollowGeneration;
+                    Task.Run(() => TrackCameraFollow(snowRunnerProcess,
+                        target.Owner, target.Action, target.ChassisBody, target.Frame,
+                        target.AssetId, moduleBase, source.Transform, generation));
+                    return $"Attached to {target.AssetId}; follow is active.";
+                }
+            }
+            catch (Exception ex)
+            {
+                return $"Attach failed: {ex.Message}";
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
         }
 
         private static void WatchMapTransitions(Process snowRunnerProcess)
@@ -792,216 +942,346 @@ namespace SnowFlyer2
             });
         }
 
-        private static IReadOnlyList<FollowTargetInfo> ScanFollowTargetCandidates(Process snowRunnerProcess)
+        private static IReadOnlyList<FollowTargetInfo> ScanValidatedTruckTargets(Process snowRunnerProcess)
         {
-            var results = new List<FollowTargetInfo>();
-            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead,
-                false, snowRunnerProcess.Id);
-            if (processHandle == IntPtr.Zero)
-                return results;
-
-            try
+            lock (TargetScanGate)
             {
-                IntPtr singleton = new IntPtr(
-                    snowRunnerProcess.MainModule.BaseAddress.ToInt64() + PlayerSingletonModuleOffset);
-                if (!TryResolveFollowTargetObject(processHandle, singleton,
-                        out IntPtr activeObject))
+                var results = new List<FollowTargetInfo>();
+                IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead,
+                    false, snowRunnerProcess.Id);
+                if (processHandle == IntPtr.Zero)
                     return results;
 
-                if (VirtualQueryEx(processHandle, activeObject,
-                        out MemoryBasicInformation region,
-                        (uint)Marshal.SizeOf(typeof(MemoryBasicInformation))) == 0 ||
-                    region.RegionSize.ToInt64() <= 0)
-                    return results;
+                try
+                {
+                    if (!TryReadTruckScanIdentity(processHandle,
+                            snowRunnerProcess.MainModule.BaseAddress,
+                            out IntPtr activeOwner, out IntPtr actionVtable,
+                            out IntPtr chassisVtable))
+                    {
+                        Console.WriteLine("Truck chassis scan: active action/body identity is not available.");
+                        return results;
+                    }
 
-                long regionBase = region.BaseAddress.ToInt64();
-                long regionEnd = regionBase + region.RegionSize.ToInt64();
-                long start = Math.Max(regionBase,
-                    activeObject.ToInt64() - FollowTargetScanRadius);
-                long end = Math.Min(regionEnd,
-                    activeObject.ToInt64() + FollowTargetScanRadius);
-                var seen = new HashSet<IntPtr>();
-                for (long address = start & ~(FollowTargetScanAlignment - 1);
-                    address + FollowTargetBasisOffset + FollowTargetBasisSize <= end;
-                    address += FollowTargetScanAlignment)
-                {
-                    if (!TryReadBytes(processHandle,
-                            new IntPtr(address + FollowTargetBasisOffset),
-                            out byte[] bytes, FollowTargetBasisSize) ||
-                        !TryParseFollowTargetSnapshot(bytes, 0,
-                            out Vector3 position, out float[] basis) ||
-                        position.LengthSquared() < 0.01f)
-                        continue;
-                    IntPtr candidate = new IntPtr(address);
-                    if (!seen.Add(candidate))
-                        continue;
-                    results.Add(new FollowTargetInfo
+                    var byOwner = new Dictionary<IntPtr, TruckTargetSnapshot>();
+                    var stopwatch = Stopwatch.StartNew();
+                    long scannedBytes = 0;
+                    bool truncated = false;
+                    IntPtr address = IntPtr.Zero;
+                    byte[] chunk = new byte[FollowTargetScanChunkSize];
+                    while (true)
                     {
-                        Address = candidate,
-                        Position = new Vector3Display(position.X, position.Y, position.Z),
-                        IsActive = candidate == activeObject,
-                        Name = TryDescribeFollowTarget(processHandle, candidate)
-                    });
-                }
-                results.Sort((left, right) =>
-                {
-                    if (left.IsActive != right.IsActive)
-                        return left.IsActive ? -1 : 1;
-                    bool leftNamed = !string.IsNullOrWhiteSpace(left.Name);
-                    bool rightNamed = !string.IsNullOrWhiteSpace(right.Name);
-                    if (leftNamed != rightNamed)
-                        return leftNamed ? -1 : 1;
-                    if (leftNamed)
+                        int queryResult = VirtualQueryEx(processHandle, address,
+                            out MemoryBasicInformation region,
+                            (uint)Marshal.SizeOf(typeof(MemoryBasicInformation)));
+                        if (queryResult == 0 || region.RegionSize.ToInt64() <= 0)
+                            break;
+
+                        long regionBase = region.BaseAddress.ToInt64();
+                        long regionSize = region.RegionSize.ToInt64();
+                        long next = regionBase + regionSize;
+                        if (next <= regionBase)
+                            break;
+
+                        if (region.State == MemoryCommit && region.Type == MemPrivate &&
+                            IsReadableMemoryProtection(region.Protect))
+                        {
+                            long regionOffset = 0;
+                            while (regionOffset < regionSize)
+                            {
+                                if (stopwatch.ElapsedMilliseconds >= FollowTargetScanMaxMilliseconds ||
+                                    scannedBytes >= FollowTargetScanMaxBytes)
+                                {
+                                    truncated = true;
+                                    break;
+                                }
+
+                                int bytesToRead = (int)Math.Min(
+                                    FollowTargetScanChunkSize, regionSize - regionOffset);
+                                if (scannedBytes + bytesToRead > FollowTargetScanMaxBytes)
+                                    bytesToRead = (int)(FollowTargetScanMaxBytes - scannedBytes);
+                                if (bytesToRead < 8)
+                                    break;
+
+                                if (ReadProcessMemory(processHandle,
+                                        new IntPtr(regionBase + regionOffset), chunk,
+                                        bytesToRead, out IntPtr bytesRead))
+                                {
+                                    int readable = Math.Min(bytesToRead, bytesRead.ToInt32());
+                                    long absoluteStart = regionBase + regionOffset;
+                                    int alignment = (int)((FollowTargetScanAlignment -
+                                        (absoluteStart & (FollowTargetScanAlignment - 1))) &
+                                        (FollowTargetScanAlignment - 1));
+                                    for (int offset = alignment; offset + 8 <= readable;
+                                        offset += FollowTargetScanAlignment)
+                                    {
+                                        if (BitConverter.ToInt64(chunk, offset) != actionVtable.ToInt64())
+                                            continue;
+                                        IntPtr action = new IntPtr(absoluteStart + offset);
+                                        if (TryReadValidatedTruckTarget(processHandle, action,
+                                                actionVtable, chassisVtable, activeOwner,
+                                                out TruckTargetSnapshot target) &&
+                                            !byOwner.ContainsKey(target.Owner))
+                                        {
+                                            byOwner.Add(target.Owner, target);
+                                        }
+                                    }
+                                }
+
+                                scannedBytes += bytesToRead;
+                                regionOffset += bytesToRead;
+                            }
+                            if (truncated)
+                                break;
+                        }
+
+                        address = new IntPtr(next);
+                    }
+
+                    foreach (TruckTargetSnapshot target in byOwner.Values)
                     {
-                        int name = string.Compare(left.Name, right.Name,
+                        results.Add(new FollowTargetInfo
+                        {
+                            Address = target.ChassisBody,
+                            OwnerAddress = target.Owner,
+                            ActionAddress = target.Action,
+                            FrameAddress = target.Frame,
+                            ChassisBodyAddress = target.ChassisBody,
+                            ChassisBodyVtable = target.ChassisVtable,
+                            AssetId = target.AssetId,
+                            BoneName = target.BoneName,
+                            Position = new Vector3Display(target.Position.X,
+                                target.Position.Y, target.Position.Z),
+                            IsActive = target.IsActive,
+                            Name = target.AssetId
+                        });
+                    }
+
+                    results.Sort((left, right) =>
+                    {
+                        if (left.IsActive != right.IsActive)
+                            return left.IsActive ? -1 : 1;
+                        return string.Compare(left.AssetId, right.AssetId,
                             StringComparison.OrdinalIgnoreCase);
-                        if (name != 0)
-                            return name;
-                    }
-                    int x = left.Position.X.CompareTo(right.Position.X);
-                    if (x != 0)
-                        return x;
-                    return left.Position.Z.CompareTo(right.Position.Z);
-                });
+                    });
+                    Console.WriteLine($"Truck chassis scan: {results.Count} validated targets, " +
+                        $"{scannedBytes / (1024 * 1024)} MiB in {stopwatch.Elapsed.TotalSeconds:F1}s" +
+                        (truncated ? " (TRUNCATED at 40s/8GiB)." : "."));
+                }
+                finally
+                {
+                    CloseHandle(processHandle);
+                }
+                return results;
             }
-            finally
-            {
-                CloseHandle(processHandle);
-            }
-            return results;
         }
 
-        private static string TryDescribeFollowTarget(IntPtr processHandle, IntPtr candidate)
+        private static bool IsReadableMemoryProtection(uint protection)
         {
-            var queue = new Queue<Tuple<IntPtr, int>>();
-            var seen = new HashSet<IntPtr>();
-            queue.Enqueue(Tuple.Create(candidate, 0));
-            string bestName = null;
-            int bestScore = 0;
-
-            while (queue.Count > 0 && seen.Count < 48)
-            {
-                Tuple<IntPtr, int> item = queue.Dequeue();
-                IntPtr address = item.Item1;
-                int depth = item.Item2;
-                if (!IsValidCameraPointer(address.ToInt64()) || !seen.Add(address))
-                    continue;
-
-                int readSize = depth == 0 ? 0x220 : 0x1000;
-                if (!TryReadBytes(processHandle, address, out byte[] bytes, readSize))
-                    continue;
-
-                if (TryExtractVehicleAssetName(bytes, out string name, out int score) &&
-                    score > bestScore)
-                {
-                    bestName = name;
-                    bestScore = score;
-                }
-
-                if (depth >= 2)
-                    continue;
-                int pointerLimit = Math.Min(bytes.Length, depth == 0 ? 0x220 : 0x400);
-                for (int offset = 0; offset + 8 <= pointerLimit; offset += 8)
-                {
-                    long value = BitConverter.ToInt64(bytes, offset);
-                    if (IsValidCameraPointer(value))
-                        queue.Enqueue(Tuple.Create(new IntPtr(value), depth + 1));
-                }
-            }
-            return bestName;
+            if ((protection & PageGuard) != 0 || (protection & PageNoAccess) != 0)
+                return false;
+            uint baseProtection = protection & 0xFF;
+            return baseProtection == PageReadOnly || baseProtection == PageReadWrite ||
+                baseProtection == PageWriteCopy || baseProtection == PageExecuteRead ||
+                baseProtection == PageExecuteReadWrite || baseProtection == PageExecuteWriteCopy;
         }
 
-        private static bool TryExtractVehicleAssetName(
-            byte[] bytes, out string name, out int score)
+        private static bool TryReadTruckScanIdentity(IntPtr processHandle,
+            IntPtr moduleBase, out IntPtr activeOwner, out IntPtr actionVtable,
+            out IntPtr chassisVtable)
         {
-            name = null;
-            score = 0;
-            if (bytes == null || bytes.Length < 8)
+            activeOwner = IntPtr.Zero;
+            actionVtable = IntPtr.Zero;
+            chassisVtable = IntPtr.Zero;
+            IntPtr singleton = new IntPtr(moduleBase.ToInt64() + PlayerSingletonModuleOffset);
+            if (!TryReadPointer(processHandle, singleton, out long rootValue) ||
+                !IsValidCameraPointer(rootValue) ||
+                !TryReadPointer(processHandle, new IntPtr(rootValue + 0x20),
+                    out long ownerValue) || !IsValidCameraPointer(ownerValue) ||
+                !TryReadPointer(processHandle, new IntPtr(ownerValue + FollowTargetOwnerActionOffset),
+                    out long actionValue) || !IsValidCameraPointer(actionValue) ||
+                !TryReadPointer(processHandle, new IntPtr(actionValue),
+                    out long actionVtableValue) ||
+                !TryReadPointer(processHandle, new IntPtr(actionValue + FollowTargetActionOwnerOffset),
+                    out long reciprocalOwner) || reciprocalOwner != ownerValue ||
+                !TryReadPointer(processHandle, new IntPtr(rootValue + 0x28),
+                    out long firstValue) || !IsValidCameraPointer(firstValue) ||
+                !TryReadPointer(processHandle, new IntPtr(firstValue + 0x18),
+                    out long bodyValue) || !IsValidCameraPointer(bodyValue) ||
+                !TryReadPointer(processHandle, new IntPtr(ownerValue + FollowTargetOwnerBodyOffset),
+                    out long ownerBodyValue) || bodyValue != ownerBodyValue ||
+                !TryReadPointer(processHandle, new IntPtr(bodyValue),
+                    out long chassisVtableValue))
                 return false;
 
-            string[] texts =
+            activeOwner = new IntPtr(ownerValue);
+            actionVtable = new IntPtr(actionVtableValue);
+            chassisVtable = new IntPtr(chassisVtableValue);
+            return IsValidCameraPointer(actionVtableValue) &&
+                IsValidCameraPointer(chassisVtableValue);
+        }
+
+        private static bool TryReadValidatedTruckTarget(IntPtr processHandle,
+            IntPtr action, IntPtr actionVtable, IntPtr chassisVtable,
+            IntPtr activeOwner, out TruckTargetSnapshot target)
+        {
+            target = null;
+            if (!IsValidCameraPointer(action.ToInt64()) ||
+                !IsValidCameraPointer(actionVtable.ToInt64()) ||
+                !IsValidCameraPointer(chassisVtable.ToInt64()) ||
+                !TryReadPointer(processHandle, action, out long currentVtable) ||
+                currentVtable != actionVtable.ToInt64() ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(action.ToInt64() + FollowTargetActionOwnerOffset),
+                    out long ownerValue) || !IsValidCameraPointer(ownerValue) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(ownerValue + FollowTargetOwnerActionOffset),
+                    out long reciprocalAction) || reciprocalAction != action.ToInt64() ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(ownerValue + FollowTargetOwnerBodyOffset),
+                    out long bodyValue) || !IsValidCameraPointer(bodyValue) ||
+                !TryReadPointer(processHandle, new IntPtr(bodyValue),
+                    out long bodyVtable) || bodyVtable != chassisVtable.ToInt64())
+                return false;
+
+            if (!TryReadPointer(processHandle,
+                    new IntPtr(ownerValue + FollowTargetOwnerModelOffset),
+                    out long modelValue) || !IsValidCameraPointer(modelValue) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(modelValue + FollowTargetModelResourceOffset),
+                    out long resourceValue) || !IsValidCameraPointer(resourceValue) ||
+                !TryReadAsciiPointer(processHandle,
+                    new IntPtr(resourceValue + FollowTargetResourceAssetOffset),
+                    out string assetId) ||
+                !assetId.StartsWith("trucks_", StringComparison.Ordinal) ||
+                assetId.StartsWith("trucks_trailers_", StringComparison.Ordinal))
+                return false;
+
+            if (!TryReadPointer(processHandle,
+                    new IntPtr(ownerValue + FollowTargetOwnerNodeOffset),
+                    out long nodeValue) || !IsValidCameraPointer(nodeValue) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(nodeValue + FollowTargetNodeDefinitionOffset),
+                    out long definitionValue) || !IsValidCameraPointer(definitionValue) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(definitionValue), out long boneValue) ||
+                !IsValidCameraPointer(boneValue) ||
+                !TryReadAscii(processHandle, new IntPtr(boneValue),
+                    out string boneName) ||
+                !IsAllowedTruckBone(assetId, boneName) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(resourceValue + FollowTargetResourceDefinitionOffset),
+                    out long resourceDefinition) || resourceDefinition != definitionValue ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(nodeValue + FollowTargetNodeModelOffset),
+                    out long nodeModel) || nodeModel != modelValue ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(nodeValue + FollowTargetNodeSelfOffset),
+                    out long nodeSelf) || nodeSelf != nodeValue)
+                return false;
+
+            if (!TryReadTransform(processHandle, new IntPtr(nodeValue),
+                    FollowTargetNodeTransformOffset, out Vector3 nodePosition,
+                    out float[] nodeBasis) ||
+                !TryReadTransform(processHandle, new IntPtr(bodyValue),
+                    FollowTargetBodyTransformOffset, out Vector3 bodyPosition,
+                    out float[] bodyBasis))
+                return false;
+
+            target = new TruckTargetSnapshot
             {
-                Encoding.ASCII.GetString(bytes),
-                Encoding.Unicode.GetString(bytes)
+                Owner = new IntPtr(ownerValue),
+                Action = action,
+                ChassisBody = new IntPtr(bodyValue),
+                Frame = new IntPtr(nodeValue),
+                ActionVtable = actionVtable,
+                ChassisVtable = chassisVtable,
+                AssetId = assetId,
+                BoneName = boneName,
+                Position = bodyPosition,
+                Basis = bodyBasis,
+                IsActive = new IntPtr(ownerValue) == activeOwner
             };
-            foreach (string text in texts)
-            {
-                string[] segments = text.Split('\0');
-                foreach (string segment in segments)
-                {
-                    if (segment.Length < 5)
-                        continue;
-                    string candidateName;
-                    int candidateScore;
-                    if (!TryNormalizeVehicleAssetName(segment,
-                            out candidateName, out candidateScore))
-                        continue;
-                    if (candidateScore > score)
-                    {
-                        name = candidateName;
-                        score = candidateScore;
-                    }
-                }
-            }
-            return name != null;
+            return true;
         }
 
-        private static bool TryNormalizeVehicleAssetName(
-            string text, out string name, out int score)
+        private static bool TryReadValidatedTruckOwner(IntPtr processHandle,
+            IntPtr owner, IntPtr actionVtable, IntPtr chassisVtable,
+            IntPtr activeOwner, out TruckTargetSnapshot target)
         {
-            name = null;
-            score = 0;
-            string lower = text.ToLowerInvariant();
-            string[] friendlyNames =
+            target = null;
+            if (!IsValidCameraPointer(owner.ToInt64()) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(owner.ToInt64() + FollowTargetOwnerActionOffset),
+                    out long actionValue) || !IsValidCameraPointer(actionValue))
+                return false;
+            if (!TryReadValidatedTruckTarget(processHandle, new IntPtr(actionValue),
+                    actionVtable, chassisVtable, activeOwner, out target))
+                return false;
+            return target.Owner == owner;
+        }
+
+        private static bool IsAllowedTruckBone(string assetId, string boneName)
+        {
+            if (string.IsNullOrEmpty(assetId) || string.IsNullOrEmpty(boneName))
+                return false;
+            return boneName == "BoneChassis_cdt";
+        }
+
+        private static bool TryReadTransform(IntPtr processHandle, IntPtr frame,
+            int transformOffset, out Vector3 position, out float[] basis)
+        {
+            position = default;
+            basis = null;
+            byte[] bytes;
+            if (!TryReadBytes(processHandle,
+                    new IntPtr(frame.ToInt64() + transformOffset),
+                    out bytes, FollowTargetTransformSize))
+                return false;
+
+            float[] values = new float[16];
+            for (int index = 0; index < values.Length; index++)
+                values[index] = BitConverter.ToSingle(bytes, index * 4);
+            basis = new float[9]
             {
-                "international_fleetstar_f2070a|Fleetstar F2070A",
-                "chevrolet_ck1500|Chevrolet CK1500",
-                "western_star_49x|Western Star 49X",
-                "white_western_star_4964|Western Star 4964",
-                "pacific_p12|Pacific P12",
-                "pacific_p16|Pacific P16",
-                "azov_64131|Azov 64131",
-                "tayga_6436|Tayga 6436",
-                "ank_mk38|ANK MK38",
-                "don_71|DON 71",
-                "khan_39_marshall|KHAN 39 Marshall"
+                values[0], values[1], values[2],
+                values[4], values[5], values[6],
+                values[8], values[9], values[10]
             };
-            foreach (string entry in friendlyNames)
-            {
-                string[] pair = entry.Split('|');
-                if (lower.IndexOf(pair[0], StringComparison.Ordinal) >= 0)
-                {
-                    name = pair[1];
-                    score = 40;
-                    return true;
-                }
-            }
-
-            int marker = lower.IndexOf("classes\\trucks\\", StringComparison.Ordinal);
-            int markerLength = "classes\\trucks\\".Length;
-            if (marker < 0)
-            {
-                marker = lower.IndexOf("classes/trucks/", StringComparison.Ordinal);
-                markerLength = "classes/trucks/".Length;
-            }
-            if (marker < 0)
-            {
-                marker = lower.IndexOf("trailer_", StringComparison.Ordinal);
-                markerLength = 0;
-            }
-            if (marker < 0)
+            if (!IsValidFollowTargetBasis(basis))
                 return false;
+            Vector3 stored = new Vector3(values[12], values[13], values[14]);
+            position = StoredZyxToWorld(stored);
+            return IsFiniteVector(position);
+        }
 
-            string candidate = text.Substring(marker + markerLength).Trim();
-            int end = candidate.IndexOfAny(new[] { '\\', '/', '"', '\'', ' ', '\r', '\n' });
-            if (end >= 0)
-                candidate = candidate.Substring(0, end);
-            if (candidate.Length < 4)
+        private static bool TryReadAsciiPointer(IntPtr processHandle, IntPtr address,
+            out string text)
+        {
+            text = null;
+            if (!TryReadPointer(processHandle, address, out long value) ||
+                !IsValidCameraPointer(value))
                 return false;
-            if (candidate.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
-                candidate = candidate.Substring(0, candidate.Length - 4);
-            name = candidate;
-            score = 20;
+            return TryReadAscii(processHandle, new IntPtr(value), out text);
+        }
+
+        private static bool TryReadAscii(IntPtr processHandle, IntPtr address,
+            out string text)
+        {
+            text = null;
+            byte[] bytes;
+            if (!TryReadBytes(processHandle, address, out bytes,
+                    FollowTargetMaxAssetLength))
+                return false;
+            int length = Array.IndexOf(bytes, (byte)0);
+            if (length <= 0)
+                return false;
+            for (int index = 0; index < length; index++)
+            {
+                if (bytes[index] < 0x20 || bytes[index] > 0x7E)
+                    return false;
+            }
+            text = Encoding.ASCII.GetString(bytes, 0, length);
             return true;
         }
 
@@ -1010,29 +1290,6 @@ namespace SnowFlyer2
         {
             buffer = new byte[size];
             return TryReadBytes(processHandle, address, buffer);
-        }
-
-        private static bool TryParseFollowTargetSnapshot(byte[] bytes, int offset,
-            out Vector3 targetPosition, out float[] targetBasis)
-        {
-            targetPosition = default;
-            targetBasis = null;
-            if (bytes == null || offset < 0 || offset + FollowTargetBasisSize > bytes.Length)
-                return false;
-            float[] strided = new float[16];
-            for (int index = 0; index < strided.Length; index++)
-                strided[index] = BitConverter.ToSingle(bytes, offset + index * 4);
-            targetBasis = new float[9]
-            {
-                strided[0], strided[1], strided[2],
-                strided[4], strided[5], strided[6],
-                strided[8], strided[9], strided[10]
-            };
-            if (!IsValidFollowTargetBasis(targetBasis))
-                return false;
-            targetPosition = StoredZyxToWorld(new Vector3(
-                strided[12], strided[13], strided[14]));
-            return IsFiniteVector(targetPosition);
         }
 
         private static void NudgeCameraPosition(Process snowRunnerProcess)
@@ -1130,7 +1387,8 @@ namespace SnowFlyer2
         }
 
         private static void TrackCameraFollow(Process snowRunnerProcess,
-            IntPtr targetObject, IntPtr moduleBase,
+            IntPtr targetOwner, IntPtr expectedAction, IntPtr expectedBody,
+            IntPtr expectedFrame, string expectedAssetId, IntPtr moduleBase,
             IntPtr expectedTransform, int generation)
         {
             IntPtr processHandle = OpenProcess(
@@ -1157,20 +1415,27 @@ namespace SnowFlyer2
                             return;
 
                         CameraSourceSnapshot source;
-                        Vector3 playerPosition;
-                        float[] targetBasis;
-                        if (!TryReadFollowTargetState(processHandle, targetObject,
-                                out playerPosition, out targetBasis) ||
+                        if (!TryReadTruckScanIdentity(processHandle, moduleBase,
+                                out IntPtr activeOwner, out IntPtr actionVtable,
+                                out IntPtr chassisVtable) ||
+                            !TryReadValidatedTruckOwner(processHandle, targetOwner,
+                                actionVtable, chassisVtable, activeOwner,
+                                out TruckTargetSnapshot target) ||
+                            target.Action != expectedAction ||
+                            target.ChassisBody != expectedBody ||
+                            target.Frame != expectedFrame ||
+                            !string.Equals(target.AssetId, expectedAssetId,
+                                StringComparison.Ordinal) ||
                             !TryReadCameraSourceSnapshot(processHandle, moduleBase, false, false, out source))
                         {
-                            failure = "Camera follow could not resolve the current game state.";
+                            failure = "Camera follow target identity changed; follow stopped.";
                         }
                         else if (source.Transform != expectedTransform)
                         {
                             failure = "Camera source pointer changed; follow stopped.";
                         }
                         else if (hasPreviousPlayer &&
-                            Vector3.Distance(playerPosition, previousPlayer) > CameraFollowMaxTruckJump)
+                            Vector3.Distance(target.Position, previousPlayer) > CameraFollowMaxTruckJump)
                         {
                             failure = "Truck position jumped too far; follow stopped before writing.";
                         }
@@ -1183,11 +1448,11 @@ namespace SnowFlyer2
                                 if (residualLength > CameraFollowMaxIncrement)
                                     failure = "Native camera movement exceeded the per-frame follow bound.";
                                 else if (residualLength > CameraFollowNoiseThreshold)
-                                    CameraFollowLocalOffset += WorldOffsetToLocal(residual, targetBasis);
+                                    CameraFollowLocalOffset += WorldOffsetToLocal(residual, target.Basis);
                             }
 
-                            CameraFollowOffset = LocalOffsetToWorld(CameraFollowLocalOffset, targetBasis);
-                            Vector3 targetPosition = playerPosition + CameraFollowOffset;
+                            CameraFollowOffset = LocalOffsetToWorld(CameraFollowLocalOffset, target.Basis);
+                            Vector3 targetPosition = target.Position + CameraFollowOffset;
                             Vector3 increment = targetPosition - source.WorldPosition;
                             if (failure == null && increment.Length() > CameraFollowMaxIncrement)
                             {
@@ -1205,15 +1470,15 @@ namespace SnowFlyer2
                                 CameraFollowHasLastRequested = true;
                                 if ((DateTime.UtcNow - lastStatus).TotalSeconds >= 1.0)
                                 {
-                                    Console.WriteLine($"FOLLOW source {source.WorldPosition.X:F2} " +
+                                    Console.WriteLine($"FOLLOW {target.AssetId} source {source.WorldPosition.X:F2} " +
                                         $"{source.WorldPosition.Y:F2} {source.WorldPosition.Z:F2}; " +
                                         $"target {targetPosition.X:F2} {targetPosition.Y:F2} {targetPosition.Z:F2}; " +
-                                        $"player {playerPosition.X:F2} {playerPosition.Y:F2} {playerPosition.Z:F2}; " +
+                                        $"truck {target.Position.X:F2} {target.Position.Y:F2} {target.Position.Z:F2}; " +
                                         $"offset {CameraFollowOffset.X:F2} {CameraFollowOffset.Y:F2} {CameraFollowOffset.Z:F2}");
                                     lastStatus = DateTime.UtcNow;
                                 }
                             }
-                            previousPlayer = playerPosition;
+                            previousPlayer = target.Position;
                             hasPreviousPlayer = true;
                         }
 
@@ -1446,9 +1711,16 @@ namespace SnowFlyer2
             // must not leave a half-updated source.  Best-effort restoration is
             // followed by another cache invalidation so stale derived fields
             // are never trusted after this method reports failure.
-            TryWriteBytes(processHandle,
-                new IntPtr(transform.ToInt64() + CameraSourceTranslationOffset), prior);
-            TryInvalidateSourceCaches(processHandle, transform);
+            IntPtr translationAddress =
+                new IntPtr(transform.ToInt64() + CameraSourceTranslationOffset);
+            bool rollbackWrite = TryWriteBytes(processHandle, translationAddress, prior);
+            byte[] rollbackReadback = new byte[12];
+            bool rollbackRead = rollbackWrite &&
+                TryReadBytes(processHandle, translationAddress, rollbackReadback) &&
+                rollbackReadback.SequenceEqual(prior);
+            bool rollbackCaches = TryInvalidateSourceCaches(processHandle, transform);
+            if (!rollbackWrite || !rollbackRead || !rollbackCaches)
+                Console.WriteLine("Camera source write failed and rollback verification failed.");
             return false;
         }
 
@@ -1723,119 +1995,6 @@ namespace SnowFlyer2
                 0x18,
                 0x1A0);
             return true;
-        }
-
-        private static bool TryResolveFollowPlayerSingleton(
-            Process snowRunnerProcess,
-            out IntPtr playerCoordsBasePtr)
-        {
-            playerCoordsBasePtr = IntPtr.Zero;
-            IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
-            IntPtr knownSingleton = new IntPtr(moduleBase.ToInt64() + PlayerSingletonModuleOffset);
-            if (TryReadSingletonChain(snowRunnerProcess, knownSingleton))
-            {
-                playerCoordsBasePtr = knownSingleton;
-                return true;
-            }
-            var scanner = new Scanner(snowRunnerProcess, snowRunnerProcess.MainModule);
-            var coordsPtr = scanner.CompiledFindPattern(PatternPlayerCoords);
-            if (!coordsPtr.Found)
-                return false;
-
-            var memory = new ExternalMemory(snowRunnerProcess);
-            playerCoordsBasePtr = ReadOffsetFromCallToLeaSingleton(
-                memory,
-                snowRunnerProcess.MainModule.BaseAddress + coordsPtr.Offset + GetOpcodeLengthOfPattern(PatternPlayerCoords));
-            if (playerCoordsBasePtr == IntPtr.Zero)
-                return false;
-            return true;
-        }
-
-        private static bool TryReadSingletonChain(Process snowRunnerProcess, IntPtr singleton)
-        {
-            IntPtr handle = OpenProcess(ProcessQueryInformation | ProcessVmRead,
-                false, snowRunnerProcess.Id);
-            if (handle == IntPtr.Zero)
-                return false;
-            try
-            {
-                return TryReadPointer(handle, singleton, out long root) &&
-                    IsValidCameraPointer(root) &&
-                    TryReadPointer(handle, new IntPtr(root + 0x28), out long first) &&
-                    IsValidCameraPointer(first) &&
-                    TryReadPointer(handle, new IntPtr(first + 0x18), out long second) &&
-                    IsValidCameraPointer(second);
-            }
-            finally
-            {
-                CloseHandle(handle);
-            }
-        }
-
-        private static bool TryResolveFollowTargetObject(
-            IntPtr processHandle, IntPtr playerCoordsBasePtr,
-            out IntPtr targetObject)
-        {
-            targetObject = IntPtr.Zero;
-            if (playerCoordsBasePtr == IntPtr.Zero ||
-                !TryReadPointer(processHandle, playerCoordsBasePtr, out long rootValue) ||
-                !IsValidCameraPointer(rootValue) ||
-                !TryReadPointer(processHandle,
-                    new IntPtr(rootValue + 0x28), out long firstValue) ||
-                !IsValidCameraPointer(firstValue) ||
-                !TryReadPointer(processHandle,
-                    new IntPtr(firstValue + 0x18), out long secondValue) ||
-                !IsValidCameraPointer(secondValue))
-                return false;
-            targetObject = new IntPtr(secondValue);
-            return true;
-        }
-
-        private static bool TryReadFollowPlayerState(
-            IntPtr processHandle, IntPtr playerCoordsBasePtr,
-            out Vector3 playerPosition, out float[] targetBasis)
-        {
-            playerPosition = default;
-            targetBasis = null;
-            if (!TryResolveFollowTargetObject(processHandle, playerCoordsBasePtr,
-                    out IntPtr targetObject))
-                return false;
-            return TryReadFollowTargetState(processHandle, targetObject,
-                out playerPosition, out targetBasis);
-        }
-
-        private static bool TryReadFollowTargetState(
-            IntPtr processHandle, IntPtr targetObject,
-            out Vector3 targetPosition, out float[] targetBasis)
-        {
-            targetPosition = default;
-            targetBasis = null;
-            if (!IsValidCameraPointer(targetObject.ToInt64()))
-                return false;
-            byte[] basisBytes = new byte[FollowTargetBasisSize];
-            if (!TryReadBytes(processHandle,
-                    new IntPtr(targetObject.ToInt64() + FollowTargetBasisOffset), basisBytes))
-                return false;
-            // The three basis vectors are 16-byte aligned, with one padding/
-            // auxiliary float after each vector.  Do not treat this as a
-            // tightly packed 3x3 matrix.
-            float[] stridedBasis = new float[16];
-            for (int index = 0; index < stridedBasis.Length; index++)
-                stridedBasis[index] = BitConverter.ToSingle(basisBytes, index * 4);
-            targetBasis = new float[9]
-            {
-                stridedBasis[0], stridedBasis[1], stridedBasis[2],
-                stridedBasis[4], stridedBasis[5], stridedBasis[6],
-                stridedBasis[8], stridedBasis[9], stridedBasis[10]
-            };
-            if (!IsValidFollowTargetBasis(targetBasis))
-                return false;
-            Vector3 stored = new Vector3(
-                stridedBasis[12], stridedBasis[13], stridedBasis[14]);
-            if (!IsFiniteVector(stored))
-                return false;
-            targetPosition = StoredZyxToWorld(stored);
-            return IsFiniteVector(targetPosition);
         }
 
         private static bool IsValidFollowTargetBasis(float[] basis)

@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -10,6 +9,13 @@ namespace SnowFlyer2
     internal sealed class FollowTargetInfo
     {
         public IntPtr Address { get; set; }
+        public IntPtr OwnerAddress { get; set; }
+        public IntPtr ActionAddress { get; set; }
+        public IntPtr FrameAddress { get; set; }
+        public IntPtr ChassisBodyAddress { get; set; }
+        public IntPtr ChassisBodyVtable { get; set; }
+        public string AssetId { get; set; }
+        public string BoneName { get; set; }
         public Vector3Display Position { get; set; }
         public bool IsActive { get; set; }
         public string Name { get; set; }
@@ -17,8 +23,8 @@ namespace SnowFlyer2
         public override string ToString()
         {
             string marker = IsActive ? " [active]" : string.Empty;
-            string label = string.IsNullOrWhiteSpace(Name) ? "transform candidate" : Name;
-            return $"{label,-34} {Position.X,8:F1} {Position.Y,7:F1} {Position.Z,8:F1}   0x{Address.ToInt64():X}{marker}";
+            string label = string.IsNullOrWhiteSpace(AssetId) ? "truck" : AssetId;
+            return $"{label,-42} {Position.X,8:F1} {Position.Y,7:F1} {Position.Z,8:F1}{marker}";
         }
     }
 
@@ -43,7 +49,6 @@ namespace SnowFlyer2
         private readonly Func<string> _attach;
         private readonly ListBox _targets = new ListBox();
         private readonly Label _status = new Label();
-        private readonly CheckBox _namedOnly = new CheckBox();
         private bool _refreshing;
 
         public TargetOverlayForm(
@@ -73,7 +78,7 @@ namespace SnowFlyer2
 
             Label title = new Label
             {
-                Text = "Spectator targets (named asset / world position)",
+                Text = "Truck chassis (validated asset / physics position)",
                 AutoSize = false,
                 TextAlign = ContentAlignment.MiddleLeft,
                 Dock = DockStyle.Top,
@@ -98,9 +103,6 @@ namespace SnowFlyer2
             attachButton.Click += (sender, args) => SetStatus(_attach());
             Button close = new Button { Text = "Close", Width = 90, Height = 28 };
             close.Click += (sender, args) => Close();
-            _namedOnly.Text = "Named only";
-            _namedOnly.AutoSize = true;
-            _namedOnly.CheckedChanged += (sender, args) => RefreshTargetList();
             FlowLayoutPanel controls = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
@@ -111,7 +113,6 @@ namespace SnowFlyer2
             controls.Controls.Add(refresh);
             controls.Controls.Add(attachButton);
             controls.Controls.Add(close);
-            controls.Controls.Add(_namedOnly);
             _status.Dock = DockStyle.Bottom;
             _status.Height = 28;
             _status.Padding = new Padding(8, 5, 0, 0);
@@ -156,19 +157,16 @@ namespace SnowFlyer2
             if (_refreshing)
                 return;
             _refreshing = true;
-            IntPtr previousAddress = IntPtr.Zero;
+            IntPtr previousOwner = IntPtr.Zero;
             if (_targets.SelectedItem is FollowTargetInfo previous)
-                previousAddress = previous.Address;
+                previousOwner = previous.OwnerAddress;
             try
             {
-                SetStatus("Scanning transform candidates...");
+                SetStatus("Scanning loaded truck chassis...");
                 IReadOnlyList<FollowTargetInfo> items =
                     await Task.Run(() => _refreshTargets());
                 if (IsDisposed || Disposing)
                     return;
-                int namedCount = items.Count(item => !string.IsNullOrWhiteSpace(item.Name));
-                if (_namedOnly.Checked)
-                    items = items.Where(item => !string.IsNullOrWhiteSpace(item.Name)).ToList();
                 _targets.BeginUpdate();
                 try
                 {
@@ -180,7 +178,7 @@ namespace SnowFlyer2
                         int selected = 0;
                         for (int index = 0; index < _targets.Items.Count; index++)
                         {
-                            if (((FollowTargetInfo)_targets.Items[index]).Address == previousAddress)
+                            if (((FollowTargetInfo)_targets.Items[index]).OwnerAddress == previousOwner)
                             {
                                 selected = index;
                                 break;
@@ -193,8 +191,7 @@ namespace SnowFlyer2
                 {
                     _targets.EndUpdate();
                 }
-                string scope = _namedOnly.Checked ? "named" : "total";
-                SetStatus($"{items.Count} {scope} candidates ({namedCount} named). Select one and attach.");
+                SetStatus($"{items.Count} validated truck chassis. Select one and attach.");
             }
             catch (Exception ex)
             {

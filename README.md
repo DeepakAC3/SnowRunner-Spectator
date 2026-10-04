@@ -32,14 +32,14 @@ This branch adds a first reverse-engineering aid for the spectator project:
 - `Ctrl+F10` starts or stops read-only rendered camera position tracking.
 - `Ctrl+F11` dumps the rendered camera transform and its nearby basis candidates.
 - `Ctrl+F12` starts or stops validated camera follow. Enable freecam first; the
-  camera keeps its current offset from the active vehicle/player anchor and
-  rotates that offset with the vehicle as it steers.
+  camera keeps its current offset from the active truck chassis and
+  rotates that offset with the chassis as it steers.
 - `Ctrl+Shift+F12` performs a reversible one-unit camera-height nudge for
   diagnostics.
-- `Ctrl+Shift+F11` opens a spectator overlay. It lists validated transform
-  candidates, tries to label them from their truck/trailer asset paths, lets
-  you select one without entering it, and attaches follow to the selected
-  object. Unresolved entries remain labeled as transform candidates.
+- `Ctrl+Shift+F11` opens a spectator overlay. It scans the loaded map for
+  validated truck action owners, shows their exact `trucks_*` asset
+  IDs and physics chassis positions, and lets you attach to a selection. The
+  Attach button recenters once near the selected chassis and starts follow.
 
 When SnowRunner is the foreground window and freecam is active, the helper
 watches the `M`/`Esc` map boundary: it stops follow, disables freecam, and
@@ -91,13 +91,34 @@ in Z,Y,X order; diagnostics convert these to X,Y,Z. Basis candidates are at
 source and follow loop use the separate view-matrix chain. The former
 `+0x2A99E80` rig chain remains isolated from these diagnostics.
 
-The validated source is `SnowRunner.exe+0x2A8EB90 -> [owner+0x08]`. Follow reads
-the active anchor from `SnowRunner.exe+0x2A8EB68 -> [root+0x28] -> [object+0x18]
--> object+0x1A0` (stored Z,Y,X), then writes only the source matrix translation.
-The current runtime validation follows the active truck/player anchor while the
-vehicle moves and turns. The target overlay can now select a different
-transform-shaped object without entering it; the displayed list still needs a
-runtime name mapping before it can be called a truck-only list.
+The validated source is `SnowRunner.exe+0x2A8EB90 -> [owner+0x08]`. The target
+scanner resolves `SnowRunner.exe+0x2A8EB68 -> DRIVE_LOGIC`, then discovers the
+current action vtable and chassis body vtable from the active owner. It scans
+committed readable private memory in bounded 1 MiB chunks, capped at 40 seconds
+or 8 GiB per refresh. A result must satisfy the reciprocal action-owner link,
+the owner model/resource asset link, the chassis node model/definition/self
+links, an exact `BoneChassis_cdt`, and the matching
+`hkpRigidBody` transform vtable. This keeps inactive Fleetstar, CK1500, and
+White Western Star entries visible when their physics allocations move.
+
+Follow reads the validated chassis rigid-body basis at `owner+0x5D0+0x170`
+with position at `+0x1A0` (stored Z,Y,X), preserving the full chassis rotation,
+then writes only the source matrix translation. `Ctrl+F12` keeps the current
+camera offset. Overlay Attach performs one guarded recenter near the selected
+chassis using the camera forward vector, then starts the same owner-bound
+follow worker. Selection and every follow tick revalidate the action, asset,
+bone, frame links, and chassis body identity. The scanner scope is the loaded
+map and build-specific offsets above; runtime game verification remains
+required after a new game update.
+
+## Runtime evidence (2026-10-04)
+
+Release4 found the same three distinct truck chassis and visually attached to
+the inactive Fleetstar without entering it. During a 7.29 m CK1500 drive over
+four seconds, the camera kept the truck in frame and sampled maximum offset
+error was 0.38 m. The ordinary attach/follow path with the final identity
+guards is verified. Rebound and rollback-failure branches were not fault
+injected, and co-op remote-player follow remains unverified.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
