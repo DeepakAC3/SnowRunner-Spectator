@@ -197,7 +197,12 @@ A later Face truck + Orbit drive stopped after a coherent rotation readback
 race: basis delta 0.0021316, reconstructed position delta 0.0002 m. Release15
 keeps the strict success tolerance and retries bounded coherent rotations only
 after byte-exact rollback and cache invalidation readback succeed. Seven pure
-matrix regression checks passed; the repeat in-game test is pending.
+matrix regression checks passed. The repeat in-game Face truck + Orbit drive
+recorded 192 samples over 202 seconds and approximately 922 m of truck travel.
+Two coherent rotation readback races occurred, and follow continued after each
+with no logged fatal stop or rollback failure. Maximum sampled source-to-target
+position error was 0.131 m. The corrected menu loaded after a game restart;
+switching its pending truck choice is no longer overwritten each frame.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
