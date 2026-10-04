@@ -18,6 +18,19 @@ The live evidence is saved locally in ignored `logs/camera-nudge.json`. Other ca
 
 ## Resume point
 
-Follow mode is not working yet. Find the camera controller that produces the rendered position, then validate a reversible camera movement before implementing follow. Possible next approaches are inspecting alternative coordinate layouts (double precision or strided fields) and tracing writes to the confirmed rendered position copies.
+The writable source and follow loop are now implemented. The remaining feature
+work is recording/replay and selecting a different target; the current follow
+target is the active vehicle/player anchor.
 
 User preference: commit locally and push every tenth new commit. Last remote checkpoint was `d970357`; subsequent local commits preserve diagnostics and rendered camera tracking. Recording and replay remain README TODO items.
+
+## Resumed game evidence
+
+- A resumed game observation at PID 4248 confirmed that the direct rendered-camera global at `SnowRunner.exe+0x2A97EE0` still resolves after a game restart. The module-relative global is stable; the heap pointer it contains remains process-specific.
+- A contiguous double-precision scan across the full approximately 6 GB user address space found no matching camera-position representation. The resumed stride-16 scan started with 195 layouts; after controlled movement, 55 layouts moved, most of which were rendered-position copies rather than the producing state.
+- The producing camera source chain is `SnowRunner.exe+0x2A8EB90 -> owner+0x08` for the view-matrix source. The freecam controller is at `owner+0x18`, and its `+0x08` transform pointer matches that source.
+- The source is a row-major rigid view matrix. Inverting its translation and basis yields stored Z,Y,X camera coordinates; the cached stored position is at `source+0xB0`. To set a desired stored Z,Y,X position while preserving orientation, compute `translation = -desiredStoredZYX * basis` and write the translation at `source+0x30`. Invalidate the derived caches at `source+0x80` and `source+0xC0` with `-1` afterward.
+- The live view-matrix nudge in `logs/resume-view-nudge.json` moved rendered world Y by one unit, restored the original translation exactly, and reported zero restoration errors over a 0.484-second observation window.
+- The existing player-coordinate chain resolves an object through `SnowRunner.exe+0x2A8EB68 -> [root+0x28] -> [object+0x18]`. Its validated position begins at object offset `0x1A0` and is stored Z,Y,X; the old `0x1A8` read overlaps the third position component, the following scalar at `0x1AC`, and the next vector's first component. Loaded-code references at `0x7ff77272c221` read the transform vectors at `+0x170`, `+0x180`, `+0x190`, and `+0x1A0`; `0x7ff7727a5461` also consumes `+0x1A0` as a position vector.
+- `logs/truck-layout-before.json` and `logs/truck-layout-after.json` show identical `+0x1A0`, `+0x1B0`, and rendered values because that earlier capture was made while freecam was active.
+- A controlled runtime validation then drove the truck with freecam off, re-enabled freecam, started follow, and held forward. The anchor moved from approximately `(904.25, 115.65, 570.29)` to `(903.96, 115.65, 571.14)` while the camera target moved from `(902.26, 118.54, 558.63)` to `(901.97, 118.54, 559.48)`, preserving the approximately `(-1.99, 2.88, -11.66)` offset.

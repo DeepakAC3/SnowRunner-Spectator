@@ -31,12 +31,13 @@ This branch adds a first reverse-engineering aid for the spectator project:
 - `Ctrl+F9` probes the rendered camera position through the newly identified chain.
 - `Ctrl+F10` starts or stops read-only rendered camera position tracking.
 - `Ctrl+F11` dumps the rendered camera transform and its nearby basis candidates.
-- `Ctrl+F12` is reserved for camera follow while the writable camera state is being identified.
-- `Ctrl+Shift+F12` is reserved for a camera-position nudge; writes are currently disabled.
+- `Ctrl+F12` starts or stops validated camera follow. Enable freecam first; the
+  camera keeps its current offset from the active vehicle/player anchor.
+- `Ctrl+Shift+F12` performs a reversible one-unit camera-height nudge for
+  diagnostics.
 
 ## TODO
 
-- Identify and validate the writable camera state for positioning and follow mode.
 - Record and replay camera paths.
 
 Use the tracker in single-player first. It should print lines in this form while
@@ -68,16 +69,22 @@ p = tilt anticlockwise
 The helper only sends input to the selected SnowRunner window. It does not write
 camera or vehicle memory.
 
-The legacy pointer chain is not the rendered freecam position. Camera writes stay
-disabled until a separate transform has been validated; this avoids the character
-head and rig glitches seen during early write experiments.
+The legacy pointer chain is not the rendered freecam position. Follow writes use
+the validated view-matrix source, which avoids the character head and rig glitches
+seen during early write experiments.
 
 Reversible freecam movements identified a rendered camera transform referenced
 directly by `SnowRunner.exe+0x2A97EE0`. Its first three floats store world coordinates
 in Z,Y,X order; diagnostics convert these to X,Y,Z. Basis candidates are at
-`+0x50`, `+0x60`, and `+0x70`. This is a render-state diagnostic: the writable
-camera source and follow control still need validation, including across game
-restarts. The former `+0x2A99E80` rig chain remains isolated from these diagnostics.
+`+0x50`, `+0x60`, and `+0x70`. This is a render-state diagnostic; the writable
+source and follow loop use the separate view-matrix chain. The former
+`+0x2A99E80` rig chain remains isolated from these diagnostics.
+
+The validated source is `SnowRunner.exe+0x2A8EB90 -> [owner+0x08]`. Follow reads
+the active anchor from `SnowRunner.exe+0x2A8EB68 -> [root+0x28] -> [object+0x18]
+-> object+0x1A0` (stored Z,Y,X), then writes only the source matrix translation.
+The current runtime validation follows the active truck/player anchor while the
+vehicle moves; multiplayer and selecting a different vehicle are not yet exposed.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each

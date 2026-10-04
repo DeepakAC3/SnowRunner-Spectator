@@ -94,8 +94,14 @@ namespace SnowFlyer2
         private static bool IsTrackingCameraCoords = false;
         private static bool IsFollowingPlayer = false;
         private static Vector3 CameraFollowOffset;
+        private static readonly object CameraWriteGate = new object();
+        private static int CameraFollowGeneration;
+        private static IntPtr CameraFollowTransform;
+        private static Vector3 CameraFollowLastRequested;
+        private static bool CameraFollowHasLastRequested;
         private static bool HasCameraNudge = false;
-        private static Vector3 CameraNudgeOriginalPosition;
+        private static IntPtr CameraNudgeTransform;
+        private static byte[] CameraNudgeOriginalTranslation;
         private static byte[] PreviousCameraSnapshot;
         private static long PreviousCameraSnapshotBase;
         private static bool HasCameraScanBaseline = false;
@@ -124,6 +130,37 @@ namespace SnowFlyer2
         private const int RenderedCameraBasisOffsetA = 0x50;
         private const int RenderedCameraBasisOffsetB = 0x60;
         private const int RenderedCameraBasisOffsetC = 0x70;
+        // Validated writable freecam source view matrix.  The matrix is
+        // row-major; its inverse position is stored Z,Y,X, like the renderer.
+        private const long CameraSourceOwnerModuleOffset = 0x2A8EB90;
+        // The player singleton used by the loaded position accessor.  The
+        // signature can occur in unrelated helper code, so prefer the
+        // validated module-global directly and keep the scan as a fallback.
+        private const long PlayerSingletonModuleOffset = 0x2A8EB68;
+        private const int CameraSourceTransformOffset = 0x08;
+        private const int CameraSourceControllerOffset = 0x18;
+        private const int CameraSourceControllerTransformOffset = 0x08;
+        private const int CameraSourceMatrixSize = 0x40;
+        private const int CameraSourceWorldPositionOffset = 0xB0;
+        private const int CameraSourceTranslationOffset = 0x30;
+        private const int CameraSourceCacheFlagOffsetA = 0x80;
+        private const int CameraSourceCacheFlagOffsetB = 0xC0;
+        private const float CameraSourceHeightNudge = 1.0f;
+        private const float CameraSourcePositionTolerance = 0.1f;
+        private const float CameraSourceBasisTolerance = 0.02f;
+        private const float CameraSourceMatrixGuardTolerance = 0.001f;
+        private const float CameraFollowNoiseThreshold = 0.001f;
+        private const float CameraFollowMaxIncrement = 50.0f;
+        private const float CameraFollowMaxTruckJump = 100.0f;
+        private const int CameraFollowPeriodMilliseconds = 33;
+        private const int CameraSourceStableReadAttempts = 3;
+        private const int CameraSourceStableReadDelayMilliseconds = 2;
+        private const int VirtualKeyI = 0x49;
+        private const int VirtualKeyK = 0x4B;
+        private const int VirtualKeyJ = 0x4A;
+        private const int VirtualKeyL = 0x4C;
+        private const int VirtualKeyO = 0x4F;
+        private const int VirtualKeyU = 0x55;
         // Legacy rig chain; never use it for rendered-camera diagnostics.
         private const long KnownCameraModuleOffset = 0x2A99E80;
         private const int KnownCameraVectorOffset = 0x1B8;
@@ -147,6 +184,9 @@ namespace SnowFlyer2
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
 
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int virtualKey);
+
         [StructLayout(LayoutKind.Sequential)]
         private struct MemoryBasicInformation
         {
@@ -167,6 +207,18 @@ namespace SnowFlyer2
             public float Distance;
         }
 
+        private struct CameraSourceSnapshot
+        {
+            public IntPtr Owner;
+            public IntPtr Transform;
+            public IntPtr Controller;
+            public float[] Matrix;
+            public Vector3 ReconstructedZyx;
+            public Vector3 WorldPosition;
+            public Vector3 CachedZyx;
+            public Vector3 RenderedZyx;
+        }
+
         [STAThread]
         static void Main(string[] args)
         {
@@ -174,6 +226,7 @@ namespace SnowFlyer2
             KeybindingConfig config = keybindingManager.ReadKeybindingConfig();
 
             Process snowRunnerProcess = attachToSnowRunnerProcess();
+            IsFreeCamActive = ReadActualFreeCamFlag(snowRunnerProcess);
             HotKeyManager.RegisterHotKey(config.ToggleFlyMode, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleFreezeTime, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleTimeLapseMode, KeyModifiers.Control);
@@ -270,7 +323,7 @@ namespace SnowFlyer2
             var coordsPtr = scanner.CompiledFindPattern(PatternPlayerCoords);
 
             IntPtr PlayerCoordsBasePtr = IntPtr.Zero;
-            int[] PlayerCoordsOffsets = { 0x28, 0x18, 0x1A8 };
+            int[] PlayerCoordsOffsets = { 0x28, 0x18, 0x1A0 };
             var snowRunnerBase = snowRunnerProcess.MainModule.BaseAddress;
 
             StructPointerDescription<Vector3> PlayerCoord;
@@ -282,8 +335,12 @@ namespace SnowFlyer2
                     return;
                 PlayerCoord = new StructPointerDescription<Vector3>(memory, PlayerCoordsBasePtr, PlayerCoordsOffsets);
 
-                var playerVec = PlayerCoord.Read();
-                Console.WriteLine($"Coord: {playerVec.X:F2} {playerVec.Y:F2} {playerVec.Z:F2}");
+                var stored = PlayerCoord.Read();
+                if (IsFiniteVector(stored))
+                {
+                    var playerVec = StoredZyxToWorld(stored);
+                    Console.WriteLine($"Coord: {playerVec.X:F2} {playerVec.Y:F2} {playerVec.Z:F2}");
+                }
             }
         }
 
@@ -328,7 +385,7 @@ namespace SnowFlyer2
                     return;
                 }
 
-                int[] playerCoordsOffsets = { 0x28, 0x18, 0x1A8 };
+                int[] playerCoordsOffsets = { 0x28, 0x18, 0x1A0 };
                 var playerCoord = new StructPointerDescription<Vector3>(
                     memory,
                     playerCoordsBasePtr,
@@ -336,8 +393,12 @@ namespace SnowFlyer2
 
                 while (IsTrackingPlayerCoords)
                 {
-                    var playerVec = playerCoord.Read();
-                    Console.WriteLine($"LOCAL: {playerVec.X:F2} {playerVec.Y:F2} {playerVec.Z:F2}");
+                    var stored = playerCoord.Read();
+                    if (IsFiniteVector(stored))
+                    {
+                        var playerVec = StoredZyxToWorld(stored);
+                        Console.WriteLine($"LOCAL: {playerVec.X:F2} {playerVec.Y:F2} {playerVec.Z:F2}");
+                    }
                     Thread.Sleep(250);
                 }
             }
@@ -492,51 +553,81 @@ namespace SnowFlyer2
 
         private static void ToggleCameraFollow(Process snowRunnerProcess)
         {
-            if (IsFollowingPlayer)
+            lock (CameraWriteGate)
             {
-                IsFollowingPlayer = false;
-                Console.WriteLine("Camera follow stopped.");
+                if (IsFollowingPlayer)
+                {
+                    IsFollowingPlayer = false;
+                    CameraFollowGeneration++;
+                    Console.WriteLine("Camera follow stopped.");
+                    return;
+                }
+            }
+
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead,
+                false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+            {
+                Console.WriteLine("Could not open SnowRunner for camera follow mode.");
                 return;
             }
 
-            if (!IsFreeCamActive)
+            try
             {
-                Console.WriteLine("Camera follow requires freecam. Press Ctrl+F1 first.");
-                return;
-            }
+                lock (CameraWriteGate)
+                {
+                    if (IsFollowingPlayer)
+                        return;
+                    IntPtr playerCoordsBasePtr;
+                    if (!TryResolveFollowPlayerSingleton(snowRunnerProcess, out playerCoordsBasePtr))
+                    {
+                        Console.WriteLine("Player coordinate pointer could not be resolved for follow mode.");
+                        return;
+                    }
 
-            if (!EnableExperimentalCameraWrites)
+                    CameraSourceSnapshot source;
+                    Vector3 playerPosition;
+                    if (!TryReadFollowPlayerPosition(processHandle, playerCoordsBasePtr, out playerPosition) ||
+                        !TryReadCameraSourceSnapshot(processHandle, snowRunnerProcess.MainModule.BaseAddress,
+                            true, true, out source))
+                    {
+                        Console.WriteLine("Validated source camera state could not be read for follow mode.");
+                        return;
+                    }
+
+                    CameraFollowOffset = source.WorldPosition - playerPosition;
+                    CameraFollowTransform = source.Transform;
+                    CameraFollowLastRequested = source.WorldPosition;
+                    CameraFollowHasLastRequested = true;
+                    IsFollowingPlayer = true;
+
+                    int generation = ++CameraFollowGeneration;
+                    Console.WriteLine($"Camera follow started with offset {CameraFollowOffset.X:F2} " +
+                        $"{CameraFollowOffset.Y:F2} {CameraFollowOffset.Z:F2}.");
+                    Task.Run(() => TrackCameraFollow(snowRunnerProcess, playerCoordsBasePtr,
+                        snowRunnerProcess.MainModule.BaseAddress, source.Transform, generation));
+                }
+            }
+            catch (Exception ex)
             {
-                Console.WriteLine("Camera follow writes are disabled while the writable camera state is being identified.");
-                return;
+                Console.WriteLine($"Camera follow could not start: {ex.Message}");
             }
-
-            if (!TryReadKnownCameraVector(snowRunnerProcess, out Vector3 cameraPosition) ||
-                !TryReadPlayerCoords(snowRunnerProcess, out Vector3 playerPosition))
+            finally
             {
-                Console.WriteLine("Could not read the camera and player positions for follow mode.");
-                return;
+                CloseHandle(processHandle);
             }
-
-            CameraFollowOffset = cameraPosition - playerPosition;
-            IsFollowingPlayer = true;
-            Task.Run(() => TrackCameraFollow(snowRunnerProcess));
-            Console.WriteLine($"Camera follow started with offset {CameraFollowOffset.X:F2} " +
-                $"{CameraFollowOffset.Y:F2} {CameraFollowOffset.Z:F2}.");
         }
 
         private static void NudgeCameraPosition(Process snowRunnerProcess)
         {
-            if (!IsFreeCamActive)
+            lock (CameraWriteGate)
             {
-                Console.WriteLine("Camera position nudge requires freecam. Press Ctrl+F1 first.");
-                return;
-            }
-
-            if (!EnableExperimentalCameraWrites)
-            {
-                Console.WriteLine("Camera position writes are disabled until the writable camera state is identified.");
-                return;
+                if (IsFollowingPlayer)
+                {
+                    IsFollowingPlayer = false;
+                    CameraFollowGeneration++;
+                    Console.WriteLine("Camera follow stopped before camera nudge.");
+                }
             }
 
             IntPtr processHandle = OpenProcess(
@@ -552,41 +643,68 @@ namespace SnowFlyer2
             try
             {
                 IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
-                if (!TryReadKnownCameraBase(processHandle, moduleBase, out long cameraBase) ||
-                    !TryReadVector3(processHandle,
-                        new IntPtr(cameraBase + KnownCameraVectorOffset),
-                        out Vector3 currentPosition))
+                lock (CameraWriteGate)
                 {
-                    Console.WriteLine("Known camera position did not resolve.");
-                    return;
-                }
+                    if (IsFollowingPlayer)
+                    {
+                        Console.WriteLine("Camera follow restarted during nudge guard; nudge refused.");
+                        return;
+                    }
+                    CameraSourceSnapshot source;
+                    CameraSourceSnapshot prewrite;
+                    if (!TryReadCameraSourceSnapshot(processHandle, moduleBase, true, true, out source) ||
+                        !TryReadCameraSourceSnapshot(processHandle, moduleBase, true, true, out prewrite) ||
+                        MaxAbsDifference(source.Matrix, prewrite.Matrix) > CameraSourceMatrixGuardTolerance)
+                    {
+                        Console.WriteLine("Validated source camera state changed during nudge guard.");
+                        return;
+                    }
+                    source = prewrite;
 
-                Vector3 targetPosition;
-                if (HasCameraNudge)
-                {
-                    targetPosition = CameraNudgeOriginalPosition;
-                }
-                else
-                {
-                    CameraNudgeOriginalPosition = currentPosition;
-                    targetPosition = currentPosition + new Vector3(0.0f, 1.0f, 0.0f);
-                }
+                    byte[] originalTranslation;
+                    byte[] targetTranslation;
+                    bool restoring = HasCameraNudge;
+                    if (restoring)
+                    {
+                        if (CameraNudgeTransform != source.Transform || CameraNudgeOriginalTranslation == null)
+                        {
+                            Console.WriteLine("Camera nudge source changed; refusing restore.");
+                            return;
+                        }
+                        originalTranslation = CameraNudgeOriginalTranslation;
+                        targetTranslation = originalTranslation;
+                    }
+                    else
+                    {
+                        originalTranslation = TranslationBytes(source.Matrix);
+                        targetTranslation = BuildTranslationBytes(source.Matrix,
+                            source.WorldPosition + new Vector3(0.0f, CameraSourceHeightNudge, 0.0f));
+                    }
 
-                if (!TryWriteVector3(processHandle,
-                    new IntPtr(cameraBase + KnownCameraVectorOffset),
-                    targetPosition) ||
-                    !TryReadVector3(processHandle,
-                        new IntPtr(cameraBase + KnownCameraVectorOffset),
-                        out Vector3 writtenPosition) ||
-                    Vector3.DistanceSquared(targetPosition, writtenPosition) > 0.01f)
-                {
-                    Console.WriteLine("Camera position nudge did not read back correctly.");
-                    return;
+                    if (!TryWriteSourceTranslation(processHandle, source.Transform, targetTranslation))
+                    {
+                        Console.WriteLine("Camera source nudge did not read back or invalidate correctly.");
+                        return;
+                    }
+                    if (!restoring)
+                    {
+                        CameraNudgeOriginalTranslation = originalTranslation;
+                        CameraNudgeTransform = source.Transform;
+                        HasCameraNudge = true;
+                        Console.WriteLine("Camera source height nudged by one unit.");
+                    }
+                    else
+                    {
+                        CameraNudgeOriginalTranslation = null;
+                        CameraNudgeTransform = IntPtr.Zero;
+                        HasCameraNudge = false;
+                        Console.WriteLine("Camera source height restored.");
+                    }
                 }
-
-                HasCameraNudge = !HasCameraNudge;
-                Console.WriteLine($"Camera position {(HasCameraNudge ? "nudged" : "restored")}: " +
-                    $"{writtenPosition.X:F2} {writtenPosition.Y:F2} {writtenPosition.Z:F2}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Camera source nudge failed: {ex.Message}");
             }
             finally
             {
@@ -594,7 +712,9 @@ namespace SnowFlyer2
             }
         }
 
-        private static void TrackCameraFollow(Process snowRunnerProcess)
+        private static void TrackCameraFollow(Process snowRunnerProcess,
+            IntPtr playerCoordsBasePtr, IntPtr moduleBase,
+            IntPtr expectedTransform, int generation)
         {
             IntPtr processHandle = OpenProcess(
                 ProcessQueryInformation | ProcessVmRead | ProcessVmWrite | ProcessVmOperation,
@@ -602,59 +722,340 @@ namespace SnowFlyer2
                 snowRunnerProcess.Id);
             if (processHandle == IntPtr.Zero)
             {
-                IsFollowingPlayer = false;
-                Console.WriteLine("Could not open SnowRunner for camera follow mode.");
+                StopCameraFollow(generation, "Could not open SnowRunner for camera follow mode.");
                 return;
             }
 
             try
             {
-                if (!TryCreatePlayerCoordinateReader(snowRunnerProcess, out StructPointerDescription<Vector3> playerCoord))
+                Vector3 previousPlayer = default;
+                bool hasPreviousPlayer = false;
+                DateTime lastStatus = DateTime.UtcNow;
+                while (true)
                 {
-                    IsFollowingPlayer = false;
-                    Console.WriteLine("Player coordinate pointer could not be resolved for follow mode.");
-                    return;
-                }
-
-                IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
-                while (IsFollowingPlayer)
-                {
-                    Vector3 playerPosition = playerCoord.Read();
-                    if (!IsFiniteVector(playerPosition) ||
-                        !TryReadKnownCameraBase(processHandle, moduleBase, out long cameraBase))
+                    string failure = null;
+                    lock (CameraWriteGate)
                     {
-                        IsFollowingPlayer = false;
-                        Console.WriteLine("Camera follow could not resolve the current game state.");
-                        break;
+                        if (!IsFollowingGeneration(generation))
+                            return;
+
+                        CameraSourceSnapshot source;
+                        Vector3 playerPosition;
+                        if (!TryReadFollowPlayerPosition(processHandle, playerCoordsBasePtr, out playerPosition) ||
+                            !TryReadCameraSourceSnapshot(processHandle, moduleBase, false, false, out source))
+                        {
+                            failure = "Camera follow could not resolve the current game state.";
+                        }
+                        else if (source.Transform != expectedTransform)
+                        {
+                            failure = "Camera source pointer changed; follow stopped.";
+                        }
+                        else if (hasPreviousPlayer &&
+                            Vector3.Distance(playerPosition, previousPlayer) > CameraFollowMaxTruckJump)
+                        {
+                            failure = "Truck position jumped too far; follow stopped before writing.";
+                        }
+                        else
+                        {
+                            if (CameraFollowHasLastRequested && NativeTranslationKeyHeld())
+                            {
+                                Vector3 residual = source.WorldPosition - CameraFollowLastRequested;
+                                float residualLength = residual.Length();
+                                if (residualLength > CameraFollowMaxIncrement)
+                                    failure = "Native camera movement exceeded the per-frame follow bound.";
+                                else if (residualLength > CameraFollowNoiseThreshold)
+                                    CameraFollowOffset += residual;
+                            }
+
+                            Vector3 targetPosition = playerPosition + CameraFollowOffset;
+                            Vector3 increment = targetPosition - source.WorldPosition;
+                            if (failure == null && increment.Length() > CameraFollowMaxIncrement)
+                            {
+                                failure = "Camera follow increment exceeded the per-frame bound.";
+                            }
+                            else if (failure == null &&
+                                !TryWriteSourceTranslation(processHandle, source.Transform,
+                                    BuildTranslationBytes(source.Matrix, targetPosition)))
+                            {
+                                failure = "Camera follow could not write the validated source transform.";
+                            }
+                            else if (failure == null)
+                            {
+                                CameraFollowLastRequested = targetPosition;
+                                CameraFollowHasLastRequested = true;
+                                if ((DateTime.UtcNow - lastStatus).TotalSeconds >= 1.0)
+                                {
+                                    Console.WriteLine($"FOLLOW source {source.WorldPosition.X:F2} " +
+                                        $"{source.WorldPosition.Y:F2} {source.WorldPosition.Z:F2}; " +
+                                        $"target {targetPosition.X:F2} {targetPosition.Y:F2} {targetPosition.Z:F2}; " +
+                                        $"player {playerPosition.X:F2} {playerPosition.Y:F2} {playerPosition.Z:F2}; " +
+                                        $"offset {CameraFollowOffset.X:F2} {CameraFollowOffset.Y:F2} {CameraFollowOffset.Z:F2}");
+                                    lastStatus = DateTime.UtcNow;
+                                }
+                            }
+                            previousPlayer = playerPosition;
+                            hasPreviousPlayer = true;
+                        }
+
+                        if (failure != null)
+                        {
+                            StopCameraFollowLocked(generation);
+                        }
                     }
 
-                    Vector3 targetPosition = playerPosition + CameraFollowOffset;
-                    if (!TryWriteVector3(processHandle,
-                        new IntPtr(cameraBase + KnownCameraVectorOffset),
-                        targetPosition) ||
-                        !TryReadVector3(processHandle,
-                            new IntPtr(cameraBase + KnownCameraVectorOffset),
-                            out Vector3 writtenPosition) ||
-                        Vector3.DistanceSquared(targetPosition, writtenPosition) > 0.25f)
+                    if (failure != null)
                     {
-                        IsFollowingPlayer = false;
-                        Console.WriteLine("Camera follow could not write the camera position.");
-                        break;
+                        Console.WriteLine(failure);
+                        return;
                     }
-
-                    Console.WriteLine($"FOLLOW: {targetPosition.X:F2} {targetPosition.Y:F2} {targetPosition.Z:F2}");
-                    Thread.Sleep(100);
+                    Thread.Sleep(CameraFollowPeriodMilliseconds);
                 }
             }
             catch (Exception ex)
             {
-                IsFollowingPlayer = false;
-                Console.WriteLine($"Camera follow failed: {ex.Message}");
+                StopCameraFollow(generation, $"Camera follow failed: {ex.Message}");
             }
             finally
             {
                 CloseHandle(processHandle);
             }
+        }
+
+        private static bool IsFollowingGeneration(int generation)
+        {
+            return IsFollowingPlayer && CameraFollowGeneration == generation;
+        }
+
+        private static void StopCameraFollowLocked(int generation)
+        {
+            if (IsFollowingPlayer && CameraFollowGeneration == generation)
+            {
+                IsFollowingPlayer = false;
+                CameraFollowGeneration++;
+            }
+        }
+
+        private static void StopCameraFollow(int generation, string message)
+        {
+            bool stopped;
+            lock (CameraWriteGate)
+            {
+                stopped = IsFollowingPlayer && CameraFollowGeneration == generation;
+                StopCameraFollowLocked(generation);
+            }
+            if (stopped)
+                Console.WriteLine(message);
+        }
+
+        private static bool TryReadCameraSourceSnapshot(
+            IntPtr processHandle, IntPtr moduleBase, bool strictPosition, bool stableMatrix,
+            out CameraSourceSnapshot snapshot)
+        {
+            snapshot = default;
+            byte[] freecamFlag = new byte[1];
+            if (!TryReadBytes(processHandle,
+                new IntPtr(moduleBase.ToInt64() + FlyModeFlagOffset), freecamFlag) ||
+                freecamFlag[0] != 1)
+                return false;
+
+            if (!TryReadPointer(processHandle,
+                new IntPtr(moduleBase.ToInt64() + CameraSourceOwnerModuleOffset), out long ownerValue) ||
+                !IsValidCameraPointer(ownerValue) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(ownerValue + CameraSourceTransformOffset), out long transformValue) ||
+                !IsValidCameraPointer(transformValue) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(ownerValue + CameraSourceControllerOffset), out long controllerValue) ||
+                !IsValidCameraPointer(controllerValue) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(controllerValue + CameraSourceControllerTransformOffset),
+                    out long controllerTransformValue) ||
+                controllerTransformValue != transformValue)
+                return false;
+
+            byte[] matrixBytes = new byte[CameraSourceMatrixSize];
+            bool matrixRead = false;
+            byte[] previousMatrix = null;
+            int attempts = stableMatrix ? CameraSourceStableReadAttempts : 1;
+            for (int attempt = 0; attempt < attempts; attempt++)
+            {
+                if (!TryReadBytes(processHandle, new IntPtr(transformValue), matrixBytes))
+                    return false;
+                if (!stableMatrix || (previousMatrix != null && previousMatrix.SequenceEqual(matrixBytes)))
+                {
+                    matrixRead = true;
+                    break;
+                }
+                previousMatrix = (byte[])matrixBytes.Clone();
+                if (attempt + 1 < attempts)
+                    Thread.Sleep(CameraSourceStableReadDelayMilliseconds);
+            }
+            if (!matrixRead)
+                return false;
+
+            float[] matrix = new float[16];
+            for (int index = 0; index < matrix.Length; index++)
+                matrix[index] = BitConverter.ToSingle(matrixBytes, index * 4);
+            if (!TryReconstructSourcePosition(matrix, out Vector3 reconstructedZyx))
+                return false;
+            if (!TryReadVector3(processHandle,
+                new IntPtr(transformValue + CameraSourceWorldPositionOffset), out Vector3 cachedZyx))
+                return false;
+
+            if (!TryReadRenderedCameraVector(processHandle, moduleBase,
+                out Vector3 renderedWorld, out Vector3 renderedZyx))
+                return false;
+            if (strictPosition &&
+                (MaxAbsDifference(reconstructedZyx, cachedZyx) > CameraSourcePositionTolerance ||
+                 MaxAbsDifference(reconstructedZyx, renderedZyx) > CameraSourcePositionTolerance))
+                return false;
+
+            snapshot = new CameraSourceSnapshot
+            {
+                Owner = new IntPtr(ownerValue),
+                Transform = new IntPtr(transformValue),
+                Controller = new IntPtr(controllerValue),
+                Matrix = matrix,
+                ReconstructedZyx = reconstructedZyx,
+                WorldPosition = new Vector3(reconstructedZyx.Z, reconstructedZyx.Y, reconstructedZyx.X),
+                CachedZyx = cachedZyx,
+                RenderedZyx = renderedZyx
+            };
+            return true;
+        }
+
+        private static bool TryReconstructSourcePosition(float[] matrix, out Vector3 reconstructedZyx)
+        {
+            reconstructedZyx = default;
+            if (matrix == null || matrix.Length != 16 || matrix.Any(value => !IsFiniteFloat(value)))
+                return false;
+
+            Vector3 row0 = new Vector3(matrix[0], matrix[1], matrix[2]);
+            Vector3 row1 = new Vector3(matrix[4], matrix[5], matrix[6]);
+            Vector3 row2 = new Vector3(matrix[8], matrix[9], matrix[10]);
+            if (Math.Abs(row0.Length() - 1.0f) > CameraSourceBasisTolerance ||
+                Math.Abs(row1.Length() - 1.0f) > CameraSourceBasisTolerance ||
+                Math.Abs(row2.Length() - 1.0f) > CameraSourceBasisTolerance ||
+                Math.Abs(Vector3.Dot(row0, row1)) > CameraSourceBasisTolerance ||
+                Math.Abs(Vector3.Dot(row0, row2)) > CameraSourceBasisTolerance ||
+                Math.Abs(Vector3.Dot(row1, row2)) > CameraSourceBasisTolerance ||
+                Math.Abs(matrix[3]) > CameraSourceBasisTolerance ||
+                Math.Abs(matrix[7]) > CameraSourceBasisTolerance ||
+                Math.Abs(matrix[11]) > CameraSourceBasisTolerance ||
+                Math.Abs(matrix[15] - 1.0f) > CameraSourceBasisTolerance)
+                return false;
+
+            Vector3 translation = new Vector3(matrix[12], matrix[13], matrix[14]);
+            reconstructedZyx = new Vector3(
+                -(translation.X * row0.X + translation.Y * row0.Y + translation.Z * row0.Z),
+                -(translation.X * row1.X + translation.Y * row1.Y + translation.Z * row1.Z),
+                -(translation.X * row2.X + translation.Y * row2.Y + translation.Z * row2.Z));
+            return IsFiniteVector(reconstructedZyx);
+        }
+
+        private static bool IsValidCameraPointer(long value)
+        {
+            return value >= 0x10000 && value < 0x800000000000L;
+        }
+
+        private static float MaxAbsDifference(Vector3 first, Vector3 second)
+        {
+            return Math.Max(Math.Abs(first.X - second.X),
+                Math.Max(Math.Abs(first.Y - second.Y), Math.Abs(first.Z - second.Z)));
+        }
+
+        private static float MaxAbsDifference(float[] first, float[] second)
+        {
+            if (first == null || second == null || first.Length != second.Length)
+                return float.PositiveInfinity;
+            float result = 0.0f;
+            for (int index = 0; index < first.Length; index++)
+                result = Math.Max(result, Math.Abs(first[index] - second[index]));
+            return result;
+        }
+
+        private static byte[] TranslationBytes(float[] matrix)
+        {
+            byte[] bytes = new byte[12];
+            Buffer.BlockCopy(BitConverter.GetBytes(matrix[12]), 0, bytes, 0, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(matrix[13]), 0, bytes, 4, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(matrix[14]), 0, bytes, 8, 4);
+            return bytes;
+        }
+
+        private static byte[] BuildTranslationBytes(float[] matrix, Vector3 targetWorld)
+        {
+            Vector3 targetZyx = new Vector3(targetWorld.Z, targetWorld.Y, targetWorld.X);
+            float tx = -(targetZyx.X * matrix[0] + targetZyx.Y * matrix[4] + targetZyx.Z * matrix[8]);
+            float ty = -(targetZyx.X * matrix[1] + targetZyx.Y * matrix[5] + targetZyx.Z * matrix[9]);
+            float tz = -(targetZyx.X * matrix[2] + targetZyx.Y * matrix[6] + targetZyx.Z * matrix[10]);
+            byte[] bytes = new byte[12];
+            Buffer.BlockCopy(BitConverter.GetBytes(tx), 0, bytes, 0, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(ty), 0, bytes, 4, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(tz), 0, bytes, 8, 4);
+            return bytes;
+        }
+
+        private static bool TryWriteSourceTranslation(
+            IntPtr processHandle, IntPtr transform, byte[] translation)
+        {
+            if (translation == null || translation.Length != 12)
+                return false;
+            byte[] prior = new byte[12];
+            if (!TryReadBytes(processHandle,
+                new IntPtr(transform.ToInt64() + CameraSourceTranslationOffset), prior))
+                return false;
+
+            bool wroteTranslation = TryWriteBytes(processHandle,
+                new IntPtr(transform.ToInt64() + CameraSourceTranslationOffset), translation);
+            byte[] readback = new byte[12];
+            bool readBackExactly = wroteTranslation &&
+                TryReadBytes(processHandle,
+                    new IntPtr(transform.ToInt64() + CameraSourceTranslationOffset), readback) &&
+                MaxAbsDifference(
+                    new Vector3(BitConverter.ToSingle(translation, 0),
+                        BitConverter.ToSingle(translation, 4), BitConverter.ToSingle(translation, 8)),
+                    new Vector3(BitConverter.ToSingle(readback, 0),
+                        BitConverter.ToSingle(readback, 4), BitConverter.ToSingle(readback, 8))) <=
+                    CameraSourceMatrixGuardTolerance;
+            bool cachesInvalidated = TryInvalidateSourceCaches(processHandle, transform);
+            if (readBackExactly && cachesInvalidated)
+                return true;
+
+            // A partial translation write, readback mismatch, or cache failure
+            // must not leave a half-updated source.  Best-effort restoration is
+            // followed by another cache invalidation so stale derived fields
+            // are never trusted after this method reports failure.
+            TryWriteBytes(processHandle,
+                new IntPtr(transform.ToInt64() + CameraSourceTranslationOffset), prior);
+            TryInvalidateSourceCaches(processHandle, transform);
+            return false;
+        }
+
+        private static bool TryInvalidateSourceCaches(IntPtr processHandle, IntPtr transform)
+        {
+            bool cacheA = TryWriteBytes(processHandle,
+                new IntPtr(transform.ToInt64() + CameraSourceCacheFlagOffsetA), BitConverter.GetBytes(-1));
+            bool cacheB = TryWriteBytes(processHandle,
+                new IntPtr(transform.ToInt64() + CameraSourceCacheFlagOffsetB), BitConverter.GetBytes(-1));
+            return cacheA && cacheB;
+        }
+
+        private static bool TryWriteBytes(IntPtr processHandle, IntPtr address, byte[] buffer)
+        {
+            return buffer != null && buffer.Length > 0 &&
+                WriteProcessMemory(processHandle, address, buffer, buffer.Length,
+                    out IntPtr bytesWritten) && bytesWritten.ToInt64() == buffer.Length;
+        }
+
+        private static bool NativeTranslationKeyHeld()
+        {
+            return (GetAsyncKeyState(VirtualKeyI) & 0x8000) != 0 ||
+                   (GetAsyncKeyState(VirtualKeyK) & 0x8000) != 0 ||
+                   (GetAsyncKeyState(VirtualKeyJ) & 0x8000) != 0 ||
+                   (GetAsyncKeyState(VirtualKeyL) & 0x8000) != 0 ||
+                   (GetAsyncKeyState(VirtualKeyO) & 0x8000) != 0 ||
+                   (GetAsyncKeyState(VirtualKeyU) & 0x8000) != 0;
         }
 
         private static void ProbeCameraTransform(Process snowRunnerProcess)
@@ -900,8 +1301,84 @@ namespace SnowFlyer2
                 playerCoordsBasePtr,
                 0x28,
                 0x18,
-                0x1A8);
+                0x1A0);
             return true;
+        }
+
+        private static bool TryResolveFollowPlayerSingleton(
+            Process snowRunnerProcess,
+            out IntPtr playerCoordsBasePtr)
+        {
+            playerCoordsBasePtr = IntPtr.Zero;
+            IntPtr moduleBase = snowRunnerProcess.MainModule.BaseAddress;
+            IntPtr knownSingleton = new IntPtr(moduleBase.ToInt64() + PlayerSingletonModuleOffset);
+            if (TryReadSingletonChain(snowRunnerProcess, knownSingleton))
+            {
+                playerCoordsBasePtr = knownSingleton;
+                return true;
+            }
+            var scanner = new Scanner(snowRunnerProcess, snowRunnerProcess.MainModule);
+            var coordsPtr = scanner.CompiledFindPattern(PatternPlayerCoords);
+            if (!coordsPtr.Found)
+                return false;
+
+            var memory = new ExternalMemory(snowRunnerProcess);
+            playerCoordsBasePtr = ReadOffsetFromCallToLeaSingleton(
+                memory,
+                snowRunnerProcess.MainModule.BaseAddress + coordsPtr.Offset + GetOpcodeLengthOfPattern(PatternPlayerCoords));
+            if (playerCoordsBasePtr == IntPtr.Zero)
+                return false;
+            return true;
+        }
+
+        private static bool TryReadSingletonChain(Process snowRunnerProcess, IntPtr singleton)
+        {
+            IntPtr handle = OpenProcess(ProcessQueryInformation | ProcessVmRead,
+                false, snowRunnerProcess.Id);
+            if (handle == IntPtr.Zero)
+                return false;
+            try
+            {
+                return TryReadPointer(handle, singleton, out long root) &&
+                    IsValidCameraPointer(root) &&
+                    TryReadPointer(handle, new IntPtr(root + 0x28), out long first) &&
+                    IsValidCameraPointer(first) &&
+                    TryReadPointer(handle, new IntPtr(first + 0x18), out long second) &&
+                    IsValidCameraPointer(second);
+            }
+            finally
+            {
+                CloseHandle(handle);
+            }
+        }
+
+        private static bool TryReadFollowPlayerPosition(
+            IntPtr processHandle, IntPtr playerCoordsBasePtr, out Vector3 playerPosition)
+        {
+            playerPosition = default;
+            if (playerCoordsBasePtr == IntPtr.Zero ||
+                !TryReadPointer(processHandle, playerCoordsBasePtr, out long rootValue) ||
+                !IsValidCameraPointer(rootValue) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(rootValue + 0x28), out long firstValue) ||
+                !IsValidCameraPointer(firstValue) ||
+                !TryReadPointer(processHandle,
+                    new IntPtr(firstValue + 0x18), out long secondValue) ||
+                !IsValidCameraPointer(secondValue))
+                return false;
+
+            byte[] bytes = new byte[12];
+            if (!TryReadBytes(processHandle,
+                new IntPtr(secondValue + 0x1A0), bytes))
+                return false;
+            Vector3 stored = new Vector3(
+                BitConverter.ToSingle(bytes, 0),
+                BitConverter.ToSingle(bytes, 4),
+                BitConverter.ToSingle(bytes, 8));
+            if (!IsFiniteVector(stored))
+                return false;
+            playerPosition = StoredZyxToWorld(stored);
+            return IsFiniteVector(playerPosition);
         }
 
         private static bool TryReadPlayerCoords(Process snowRunnerProcess, out Vector3 playerVector)
@@ -925,8 +1402,11 @@ namespace SnowFlyer2
                 playerCoordsBasePtr,
                 0x28,
                 0x18,
-                0x1A8);
-            playerVector = playerCoord.Read();
+                0x1A0);
+            Vector3 stored = playerCoord.Read();
+            if (!IsFiniteVector(stored))
+                return false;
+            playerVector = StoredZyxToWorld(stored);
             return IsFiniteVector(playerVector);
         }
 
@@ -1463,6 +1943,11 @@ namespace SnowFlyer2
                    !float.IsNaN(value.Z) && !float.IsInfinity(value.Z);
         }
 
+        private static Vector3 StoredZyxToWorld(Vector3 stored)
+        {
+            return new Vector3(stored.Z, stored.Y, stored.X);
+        }
+
         private static bool IsFiniteFloat(float value)
         {
             return !float.IsNaN(value) && !float.IsInfinity(value);
@@ -1582,6 +2067,25 @@ namespace SnowFlyer2
             }
             var snowRunnerProcess = p.First();
             return snowRunnerProcess;
+        }
+
+        private static bool ReadActualFreeCamFlag(Process snowRunnerProcess)
+        {
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead,
+                false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+                return false;
+            try
+            {
+                byte[] flag = new byte[1];
+                return TryReadBytes(processHandle,
+                    new IntPtr(snowRunnerProcess.MainModule.BaseAddress.ToInt64() + FlyModeFlagOffset),
+                    flag) && flag[0] == 1;
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
         }
 
         private static void SearchAndApplyPatch(Process snowRunnerProcess, Scanner scanner, String searchPattern, byte[] patchBytes, String label)
@@ -1731,8 +2235,8 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.ProbeCameraChain +": \t Probe rendered camera position (read-only)\n");
             Console.WriteLine("Ctrl + "+ config.ToggleCameraTracking +": \t Toggle rendered camera tracking (read-only)\n");
             Console.WriteLine("Ctrl + "+ config.ProbeCameraTransform +": \t Dump rendered camera transform (read-only)\n");
-            Console.WriteLine("Ctrl + "+ config.ToggleCameraFollow +": \t Reserved for camera follow (writes disabled)\n");
-            Console.WriteLine("Ctrl + Shift + "+ config.NudgeCameraPosition +": \t Reserved for camera nudge (writes disabled)\n");
+            Console.WriteLine("Ctrl + "+ config.ToggleCameraFollow +": \t Toggle validated source camera follow\n");
+            Console.WriteLine("Ctrl + Shift + "+ config.NudgeCameraPosition +": \t Nudge/restore validated source camera height\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
