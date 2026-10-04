@@ -117,6 +117,7 @@ KEYS = {
     "escape": 0x1B,
     "tab": 0x09,
     "enter": 0x0D,
+    "delete": 0x2E,
     "alt": 0x12,
 }
 

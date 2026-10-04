@@ -30,7 +30,7 @@ namespace SnowFlyer2
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool FreeLibrary(IntPtr module);
 
-        private const uint LoadLibraryAsDatafile = 0x00000001;
+        private const uint DontResolveDllReferences = 0x00000001;
 
         private static bool LoadSpectatorUi(Process game)
         {
@@ -103,7 +103,7 @@ namespace SnowFlyer2
                 // DONT_RESOLVE_DLL_REFERENCES, then call that RVA in the
                 // already-loaded remote module after LoadLibraryW returned.
                 IntPtr localImage = LoadLibraryEx(path, IntPtr.Zero,
-                    LoadLibraryAsDatafile);
+                    DontResolveDllReferences);
                 if (localImage == IntPtr.Zero)
                 {
                     Console.WriteLine("Loaded SpectatorUI.dll, but its initializer image could not be inspected.");
