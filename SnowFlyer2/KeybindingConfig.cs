@@ -51,5 +51,8 @@ namespace SnowFlyer2
 
         [JsonConverter(typeof(HexConverter))]
         public Keys NudgeCameraPosition { get; set; }
+
+        [JsonConverter(typeof(HexConverter))]
+        public Keys ToggleTargetOverlay { get; set; }
     }
 }

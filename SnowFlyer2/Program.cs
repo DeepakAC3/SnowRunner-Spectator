@@ -87,7 +87,11 @@ namespace SnowFlyer2
         // Player location
         private static string PatternPlayerCoords = "0F B6 5C 24 70 84 DB 75 43";
 
-        private static bool IsFreeCamActive = false;
+        private static volatile bool IsFreeCamActive = false;
+        private static volatile bool MapFreeCamRestorePending = false;
+        private static int MapTransitionGeneration;
+        private static bool MapKeyWasDown;
+        private static bool EscapeKeyWasDown;
         private static bool ShouldLoopTime = false;
         private static bool IsTimePassing = true;
         private static bool IsTrackingPlayerCoords = false;
@@ -96,9 +100,12 @@ namespace SnowFlyer2
         private static Vector3 CameraFollowOffset;
         private static Vector3 CameraFollowLocalOffset;
         private static readonly object CameraWriteGate = new object();
+        private static readonly object FreeCamTransitionGate = new object();
         private static int CameraFollowGeneration;
         private static Vector3 CameraFollowLastRequested;
         private static bool CameraFollowHasLastRequested;
+        private static IntPtr SelectedFollowTargetObject;
+        private static TargetOverlayForm TargetOverlay;
         private static bool HasCameraNudge = false;
         private static IntPtr CameraNudgeTransform;
         private static byte[] CameraNudgeOriginalTranslation;
@@ -144,6 +151,8 @@ namespace SnowFlyer2
         // Basis vectors at +0x170/+0x180/+0x190 and position at +0x1A0
         // share one 16-byte-strided snapshot.
         private const int FollowTargetBasisSize = 0x40;
+        private const int FollowTargetScanAlignment = 0x10;
+        private const int FollowTargetScanRadius = 0x1000000;
         private const int CameraSourceMatrixSize = 0x40;
         private const int CameraSourceWorldPositionOffset = 0xB0;
         private const int CameraSourceTranslationOffset = 0x30;
@@ -166,6 +175,8 @@ namespace SnowFlyer2
         private const int VirtualKeyL = 0x4C;
         private const int VirtualKeyO = 0x4F;
         private const int VirtualKeyU = 0x55;
+        private const int VirtualKeyM = 0x4D;
+        private const int VirtualKeyEscape = 0x1B;
         // Legacy rig chain; never use it for rendered-camera diagnostics.
         private const long KnownCameraModuleOffset = 0x2A99E80;
         private const int KnownCameraVectorOffset = 0x1B8;
@@ -191,6 +202,12 @@ namespace SnowFlyer2
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int virtualKey);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr windowHandle, out uint processId);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct MemoryBasicInformation
@@ -232,6 +249,7 @@ namespace SnowFlyer2
 
             Process snowRunnerProcess = attachToSnowRunnerProcess();
             IsFreeCamActive = ReadActualFreeCamFlag(snowRunnerProcess);
+            Task.Run(() => WatchMapTransitions(snowRunnerProcess));
             HotKeyManager.RegisterHotKey(config.ToggleFlyMode, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleFreezeTime, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleTimeLapseMode, KeyModifiers.Control);
@@ -245,6 +263,7 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.ProbeCameraTransform, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleCameraFollow, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.NudgeCameraPosition, KeyModifiers.Control | KeyModifiers.Shift);
+            HotKeyManager.RegisterHotKey(config.ToggleTargetOverlay, KeyModifiers.Control | KeyModifiers.Shift);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
 
             bool showMenu = true;
@@ -583,17 +602,21 @@ namespace SnowFlyer2
                 {
                     if (IsFollowingPlayer)
                         return;
-                    IntPtr playerCoordsBasePtr;
-                    if (!TryResolveFollowPlayerSingleton(snowRunnerProcess, out playerCoordsBasePtr))
+                    IntPtr targetObject = SelectedFollowTargetObject;
+                    if (!IsValidCameraPointer(targetObject.ToInt64()) &&
+                        (!TryResolveFollowPlayerSingleton(snowRunnerProcess,
+                            out IntPtr playerCoordsBasePtr) ||
+                         !TryResolveFollowTargetObject(processHandle, playerCoordsBasePtr,
+                            out targetObject)))
                     {
-                        Console.WriteLine("Player coordinate pointer could not be resolved for follow mode.");
+                        Console.WriteLine("No valid spectator target could be resolved for follow mode.");
                         return;
                     }
 
                     CameraSourceSnapshot source;
                     Vector3 playerPosition;
                     float[] targetBasis;
-                    if (!TryReadFollowPlayerState(processHandle, playerCoordsBasePtr,
+                    if (!TryReadFollowTargetState(processHandle, targetObject,
                             out playerPosition, out targetBasis) ||
                         !TryReadCameraSourceSnapshot(processHandle, snowRunnerProcess.MainModule.BaseAddress,
                             true, true, out source))
@@ -611,7 +634,7 @@ namespace SnowFlyer2
                     int generation = ++CameraFollowGeneration;
                     Console.WriteLine($"Camera follow started with offset {CameraFollowOffset.X:F2} " +
                         $"{CameraFollowOffset.Y:F2} {CameraFollowOffset.Z:F2}.");
-                    Task.Run(() => TrackCameraFollow(snowRunnerProcess, playerCoordsBasePtr,
+                    Task.Run(() => TrackCameraFollow(snowRunnerProcess, targetObject,
                         snowRunnerProcess.MainModule.BaseAddress, source.Transform, generation));
                 }
             }
@@ -623,6 +646,246 @@ namespace SnowFlyer2
             {
                 CloseHandle(processHandle);
             }
+        }
+
+        private static void ToggleTargetOverlay(Process snowRunnerProcess)
+        {
+            if (TargetOverlay != null && !TargetOverlay.IsDisposed)
+            {
+                TargetOverlay.Close();
+                TargetOverlay = null;
+                return;
+            }
+
+            TargetOverlay = new TargetOverlayForm(
+                () => ScanFollowTargetCandidates(snowRunnerProcess),
+                SelectFollowTarget,
+                () =>
+                {
+                    ToggleCameraFollow(snowRunnerProcess);
+                    return IsFollowingPlayer ? "Camera follow is active." : "Camera follow is stopped.";
+                },
+                snowRunnerProcess.MainWindowHandle);
+            TargetOverlay.FormClosed += (sender, args) => TargetOverlay = null;
+            TargetOverlay.Show();
+        }
+
+        private static void SelectFollowTarget(FollowTargetInfo target)
+        {
+            if (target == null || target.Address == IntPtr.Zero)
+                return;
+            lock (CameraWriteGate)
+            {
+                if (IsFollowingPlayer)
+                {
+                    IsFollowingPlayer = false;
+                    CameraFollowGeneration++;
+                    Console.WriteLine("Camera follow stopped before changing target.");
+                }
+                SelectedFollowTargetObject = target.Address;
+            }
+            Console.WriteLine($"Selected spectator target {target.Address.ToInt64():X} at " +
+                $"{target.Position.X:F2} {target.Position.Y:F2} {target.Position.Z:F2}.");
+        }
+
+        private static void WatchMapTransitions(Process snowRunnerProcess)
+        {
+            try
+            {
+                while (!snowRunnerProcess.HasExited)
+                {
+                    if (!IsSnowRunnerForeground(snowRunnerProcess))
+                    {
+                        MapKeyWasDown = false;
+                        EscapeKeyWasDown = false;
+                        Thread.Sleep(10);
+                        continue;
+                    }
+                    bool mapDown = GetAsyncKeyState(VirtualKeyM) < 0;
+                    bool escapeDown = GetAsyncKeyState(VirtualKeyEscape) < 0;
+                    if (mapDown && !MapKeyWasDown)
+                    {
+                        if (IsFreeCamActive)
+                            BeginMapFreeCamSafety(snowRunnerProcess);
+                        else if (MapFreeCamRestorePending)
+                            RequestMapFreeCamRestore(snowRunnerProcess);
+                    }
+                    if (escapeDown && !EscapeKeyWasDown && MapFreeCamRestorePending)
+                        RequestMapFreeCamRestore(snowRunnerProcess);
+                    MapKeyWasDown = mapDown;
+                    EscapeKeyWasDown = escapeDown;
+                    Thread.Sleep(5);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Map transition watcher stopped: {ex.Message}");
+            }
+        }
+
+        private static bool IsSnowRunnerForeground(Process snowRunnerProcess)
+        {
+            IntPtr foreground = GetForegroundWindow();
+            if (foreground == IntPtr.Zero)
+                return false;
+            GetWindowThreadProcessId(foreground, out uint foregroundPid);
+            return foregroundPid == (uint)snowRunnerProcess.Id;
+        }
+
+        private static void BeginMapFreeCamSafety(Process snowRunnerProcess)
+        {
+            bool disable;
+            lock (CameraWriteGate)
+            {
+                disable = IsFreeCamActive && !MapFreeCamRestorePending;
+                if (!disable)
+                    return;
+                MapFreeCamRestorePending = true;
+                MapTransitionGeneration++;
+                if (IsFollowingPlayer)
+                {
+                    IsFollowingPlayer = false;
+                    CameraFollowGeneration++;
+                }
+            }
+            Console.WriteLine("Map opening: follow stopped and freecam is being disabled.");
+            bool disabled = DisableFreeCam(snowRunnerProcess);
+            lock (CameraWriteGate)
+            {
+                if (!disabled || IsFreeCamActive)
+                {
+                    MapFreeCamRestorePending = false;
+                    Console.WriteLine("Map opening: freecam disable failed; restore state cleared.");
+                }
+            }
+        }
+
+        private static void RequestMapFreeCamRestore(Process snowRunnerProcess)
+        {
+            int generation;
+            lock (CameraWriteGate)
+            {
+                if (!MapFreeCamRestorePending)
+                    return;
+                generation = ++MapTransitionGeneration;
+            }
+            Task.Run(() =>
+            {
+                Thread.Sleep(500);
+                bool restore;
+                lock (CameraWriteGate)
+                {
+                    restore = MapFreeCamRestorePending &&
+                        generation == MapTransitionGeneration &&
+                        !IsFreeCamActive;
+                }
+                if (!restore)
+                    return;
+                Console.WriteLine("Map closed: restoring freecam after the world camera is ready.");
+                bool enabled = EnableFreeCam(snowRunnerProcess);
+                lock (CameraWriteGate)
+                {
+                    if (enabled && generation == MapTransitionGeneration)
+                        MapFreeCamRestorePending = false;
+                }
+            });
+        }
+
+        private static IReadOnlyList<FollowTargetInfo> ScanFollowTargetCandidates(Process snowRunnerProcess)
+        {
+            var results = new List<FollowTargetInfo>();
+            IntPtr processHandle = OpenProcess(ProcessQueryInformation | ProcessVmRead,
+                false, snowRunnerProcess.Id);
+            if (processHandle == IntPtr.Zero)
+                return results;
+
+            try
+            {
+                IntPtr singleton = new IntPtr(
+                    snowRunnerProcess.MainModule.BaseAddress.ToInt64() + PlayerSingletonModuleOffset);
+                if (!TryResolveFollowTargetObject(processHandle, singleton,
+                        out IntPtr activeObject))
+                    return results;
+
+                if (VirtualQueryEx(processHandle, activeObject,
+                        out MemoryBasicInformation region,
+                        (uint)Marshal.SizeOf(typeof(MemoryBasicInformation))) == 0 ||
+                    region.RegionSize.ToInt64() <= 0)
+                    return results;
+
+                long regionBase = region.BaseAddress.ToInt64();
+                long regionEnd = regionBase + region.RegionSize.ToInt64();
+                long start = Math.Max(regionBase,
+                    activeObject.ToInt64() - FollowTargetScanRadius);
+                long end = Math.Min(regionEnd,
+                    activeObject.ToInt64() + FollowTargetScanRadius);
+                var seen = new HashSet<IntPtr>();
+                for (long address = start & ~(FollowTargetScanAlignment - 1);
+                    address + FollowTargetBasisOffset + FollowTargetBasisSize <= end;
+                    address += FollowTargetScanAlignment)
+                {
+                    if (!TryReadBytes(processHandle,
+                            new IntPtr(address + FollowTargetBasisOffset),
+                            out byte[] bytes, FollowTargetBasisSize) ||
+                        !TryParseFollowTargetSnapshot(bytes, 0,
+                            out Vector3 position, out float[] basis) ||
+                        position.LengthSquared() < 0.01f)
+                        continue;
+                    IntPtr candidate = new IntPtr(address);
+                    if (!seen.Add(candidate))
+                        continue;
+                    results.Add(new FollowTargetInfo
+                    {
+                        Address = candidate,
+                        Position = new Vector3Display(position.X, position.Y, position.Z),
+                        IsActive = candidate == activeObject
+                    });
+                }
+                results.Sort((left, right) =>
+                {
+                    if (left.IsActive != right.IsActive)
+                        return left.IsActive ? -1 : 1;
+                    int x = left.Position.X.CompareTo(right.Position.X);
+                    if (x != 0)
+                        return x;
+                    return left.Position.Z.CompareTo(right.Position.Z);
+                });
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
+            return results;
+        }
+
+        private static bool TryReadBytes(IntPtr processHandle, IntPtr address,
+            out byte[] buffer, int size)
+        {
+            buffer = new byte[size];
+            return TryReadBytes(processHandle, address, buffer);
+        }
+
+        private static bool TryParseFollowTargetSnapshot(byte[] bytes, int offset,
+            out Vector3 targetPosition, out float[] targetBasis)
+        {
+            targetPosition = default;
+            targetBasis = null;
+            if (bytes == null || offset < 0 || offset + FollowTargetBasisSize > bytes.Length)
+                return false;
+            float[] strided = new float[16];
+            for (int index = 0; index < strided.Length; index++)
+                strided[index] = BitConverter.ToSingle(bytes, offset + index * 4);
+            targetBasis = new float[9]
+            {
+                strided[0], strided[1], strided[2],
+                strided[4], strided[5], strided[6],
+                strided[8], strided[9], strided[10]
+            };
+            if (!IsValidFollowTargetBasis(targetBasis))
+                return false;
+            targetPosition = StoredZyxToWorld(new Vector3(
+                strided[12], strided[13], strided[14]));
+            return IsFiniteVector(targetPosition);
         }
 
         private static void NudgeCameraPosition(Process snowRunnerProcess)
@@ -720,7 +983,7 @@ namespace SnowFlyer2
         }
 
         private static void TrackCameraFollow(Process snowRunnerProcess,
-            IntPtr playerCoordsBasePtr, IntPtr moduleBase,
+            IntPtr targetObject, IntPtr moduleBase,
             IntPtr expectedTransform, int generation)
         {
             IntPtr processHandle = OpenProcess(
@@ -749,7 +1012,7 @@ namespace SnowFlyer2
                         CameraSourceSnapshot source;
                         Vector3 playerPosition;
                         float[] targetBasis;
-                        if (!TryReadFollowPlayerState(processHandle, playerCoordsBasePtr,
+                        if (!TryReadFollowTargetState(processHandle, targetObject,
                                 out playerPosition, out targetBasis) ||
                             !TryReadCameraSourceSnapshot(processHandle, moduleBase, false, false, out source))
                         {
@@ -1362,12 +1625,11 @@ namespace SnowFlyer2
             }
         }
 
-        private static bool TryReadFollowPlayerState(
+        private static bool TryResolveFollowTargetObject(
             IntPtr processHandle, IntPtr playerCoordsBasePtr,
-            out Vector3 playerPosition, out float[] targetBasis)
+            out IntPtr targetObject)
         {
-            playerPosition = default;
-            targetBasis = null;
+            targetObject = IntPtr.Zero;
             if (playerCoordsBasePtr == IntPtr.Zero ||
                 !TryReadPointer(processHandle, playerCoordsBasePtr, out long rootValue) ||
                 !IsValidCameraPointer(rootValue) ||
@@ -1378,10 +1640,34 @@ namespace SnowFlyer2
                     new IntPtr(firstValue + 0x18), out long secondValue) ||
                 !IsValidCameraPointer(secondValue))
                 return false;
+            targetObject = new IntPtr(secondValue);
+            return true;
+        }
 
+        private static bool TryReadFollowPlayerState(
+            IntPtr processHandle, IntPtr playerCoordsBasePtr,
+            out Vector3 playerPosition, out float[] targetBasis)
+        {
+            playerPosition = default;
+            targetBasis = null;
+            if (!TryResolveFollowTargetObject(processHandle, playerCoordsBasePtr,
+                    out IntPtr targetObject))
+                return false;
+            return TryReadFollowTargetState(processHandle, targetObject,
+                out playerPosition, out targetBasis);
+        }
+
+        private static bool TryReadFollowTargetState(
+            IntPtr processHandle, IntPtr targetObject,
+            out Vector3 targetPosition, out float[] targetBasis)
+        {
+            targetPosition = default;
+            targetBasis = null;
+            if (!IsValidCameraPointer(targetObject.ToInt64()))
+                return false;
             byte[] basisBytes = new byte[FollowTargetBasisSize];
             if (!TryReadBytes(processHandle,
-                    new IntPtr(secondValue + FollowTargetBasisOffset), basisBytes))
+                    new IntPtr(targetObject.ToInt64() + FollowTargetBasisOffset), basisBytes))
                 return false;
             // The three basis vectors are 16-byte aligned, with one padding/
             // auxiliary float after each vector.  Do not treat this as a
@@ -1401,8 +1687,8 @@ namespace SnowFlyer2
                 stridedBasis[12], stridedBasis[13], stridedBasis[14]);
             if (!IsFiniteVector(stored))
                 return false;
-            playerPosition = StoredZyxToWorld(stored);
-            return IsFiniteVector(playerPosition);
+            targetPosition = StoredZyxToWorld(stored);
+            return IsFiniteVector(targetPosition);
         }
 
         private static bool IsValidFollowTargetBasis(float[] basis)
@@ -2071,45 +2357,55 @@ namespace SnowFlyer2
         }
 
 
-        private static void EnableFreeCam(Process snowRunnerProcess)
+        private static bool EnableFreeCam(Process snowRunnerProcess)
         {
-            var scanner = new Scanner(snowRunnerProcess, snowRunnerProcess.MainModule);
-            try
+            lock (FreeCamTransitionGate)
             {
-                SearchAndApplyPatch(snowRunnerProcess, scanner, DevCheckPattern, DevCheckPatch, "DevMode");
-                SearchAndApplyPatch(snowRunnerProcess, scanner, DevCheckPatternB, DevCheckPatchB, "DevModeB");
-                ForceApplyPatchAtOffset(snowRunnerProcess, FlyModeFlagOffset, FlyModeOnPatch, "FlyMode");
+                var scanner = new Scanner(snowRunnerProcess, snowRunnerProcess.MainModule);
+                try
+                {
+                    SearchAndApplyPatch(snowRunnerProcess, scanner, DevCheckPattern, DevCheckPatch, "DevMode");
+                    SearchAndApplyPatch(snowRunnerProcess, scanner, DevCheckPatternB, DevCheckPatchB, "DevModeB");
+                    ForceApplyPatchAtOffset(snowRunnerProcess, FlyModeFlagOffset, FlyModeOnPatch, "FlyMode");
 
-                Console.BackgroundColor = ConsoleColor.Blue;
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.WriteLine("\n\n FreeCam Enabled!");
-                Console.ResetColor();
-                IsFreeCamActive = true;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine(ex.Message);
+                    Console.BackgroundColor = ConsoleColor.Blue;
+                    Console.ForegroundColor = ConsoleColor.White;
+                    Console.WriteLine("\n\n FreeCam Enabled!");
+                    Console.ResetColor();
+                    IsFreeCamActive = true;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.Message);
+                    return false;
+                }
             }
         }
 
-        private static void DisableFreeCam(Process snowRunnerProcess)
+        private static bool DisableFreeCam(Process snowRunnerProcess)
         {
-            var scanner = new Scanner(snowRunnerProcess, snowRunnerProcess.MainModule);
-            try
+            lock (FreeCamTransitionGate)
             {
-                SearchAndApplyPatch(snowRunnerProcess, scanner, DevCheckRevertPattern, DevCheckRevertPatch, "DevMode");
-                SearchAndApplyPatch(snowRunnerProcess, scanner, DevCheckRevertPatternB, DevCheckRevertPatchB, "DevModeB");
-                ForceApplyPatchAtOffset(snowRunnerProcess, FlyModeFlagOffset, FlyModeRevertPatch, "FlyMode");
+                var scanner = new Scanner(snowRunnerProcess, snowRunnerProcess.MainModule);
+                try
+                {
+                    SearchAndApplyPatch(snowRunnerProcess, scanner, DevCheckRevertPattern, DevCheckRevertPatch, "DevMode");
+                    SearchAndApplyPatch(snowRunnerProcess, scanner, DevCheckRevertPatternB, DevCheckRevertPatchB, "DevModeB");
+                    ForceApplyPatchAtOffset(snowRunnerProcess, FlyModeFlagOffset, FlyModeRevertPatch, "FlyMode");
 
-                Console.BackgroundColor = ConsoleColor.Blue;
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.WriteLine("\n\n FreeCam Disabled!");
-                Console.ResetColor();
-                IsFreeCamActive = false;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine(ex.Message);
+                    Console.BackgroundColor = ConsoleColor.Blue;
+                    Console.ForegroundColor = ConsoleColor.White;
+                    Console.WriteLine("\n\n FreeCam Disabled!");
+                    Console.ResetColor();
+                    IsFreeCamActive = false;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.Message);
+                    return false;
+                }
             }
         }
 
@@ -2295,6 +2591,7 @@ namespace SnowFlyer2
             Console.WriteLine("Ctrl + "+ config.ProbeCameraTransform +": \t Dump rendered camera transform (read-only)\n");
             Console.WriteLine("Ctrl + "+ config.ToggleCameraFollow +": \t Toggle validated source camera follow\n");
             Console.WriteLine("Ctrl + Shift + "+ config.NudgeCameraPosition +": \t Nudge/restore validated source camera height\n");
+            Console.WriteLine("Ctrl + Shift + "+ config.ToggleTargetOverlay +": \t Open/close spectator target overlay\n");
         }
 
         private static void ConsoleLogWithColour(string content, ConsoleColor foreground, ConsoleColor background)
@@ -2379,6 +2676,11 @@ namespace SnowFlyer2
             else if (e2.Key == config.ToggleCameraTracking)
             {
                 ToggleCameraCoordTracking(snowRunnerProcess);
+            }
+            else if (e2.Key == config.ToggleTargetOverlay &&
+                e2.Modifiers == (KeyModifiers.Control | KeyModifiers.Shift))
+            {
+                ToggleTargetOverlay(snowRunnerProcess);
             }
             else if (e2.Key == config.ProbeCameraTransform)
             {

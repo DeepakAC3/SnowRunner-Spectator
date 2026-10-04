@@ -18,9 +18,14 @@ The live evidence is saved locally in ignored `logs/camera-nudge.json`. Other ca
 
 ## Resume point
 
-The writable source and follow loop are now implemented. The remaining feature
-work is recording/replay and selecting a different target; the current follow
-target is the active vehicle/player anchor.
+The writable source and follow loop are now implemented. The target overlay
+scans the active transform allocation, lists nonzero transform candidates, and
+passes a selected object directly into the guarded follow loop. It is currently
+position/address based; mapping each candidate to the map's truck name remains
+an investigation item. A foreground-gated map-transition watcher polls
+SnowRunner's `M` and `Esc` boundaries, stops follow, disables freecam at the map
+boundary, and restores freecam after the world view returns. The guard is
+best-effort because it polls the key state while the game handles the same key.
 
 User preference: commit locally and push every tenth new commit. Last remote checkpoint was `d970357`; subsequent local commits preserve diagnostics and rendered camera tracking. Recording and replay remain README TODO items.
 
@@ -35,3 +40,4 @@ User preference: commit locally and push every tenth new commit. Last remote che
 - `logs/truck-layout-before.json` and `logs/truck-layout-after.json` show identical `+0x1A0`, `+0x1B0`, and rendered values because that earlier capture was made while freecam was active.
 - A controlled runtime validation then drove the truck with freecam off, re-enabled freecam, started follow, and held forward. The anchor moved from approximately `(904.25, 115.65, 570.29)` to `(903.96, 115.65, 571.14)` while the camera target moved from `(902.26, 118.54, 558.63)` to `(901.97, 118.54, 559.48)`, preserving the approximately `(-1.99, 2.88, -11.66)` offset.
 - The follow loop now reads the target’s 16-byte-strided basis vectors at `+0x170`, `+0x180`, and `+0x190`, converts the initial world offset into target-local coordinates, and rotates that offset with the target. A controlled `W+D` runtime pass changed the reported world offset from `(13.86, 4.90, 3.90)` to approximately `(-1.67, 2.86, 9.33)` as the truck turned while the camera target continued tracking it.
+- A live overlay test selected a non-active candidate at approximately `(-583.14, 69.46, -115.79)` and started follow with a distinct offset, proving selection does not require entering the current truck. A separate live `M` test reproduced the black-map failure with freecam active; the rebuilt watcher then observed `M`, stopped follow, and changed the freecam flag from `1` to `0` before map navigation.

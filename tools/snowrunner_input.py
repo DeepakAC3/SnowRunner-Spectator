@@ -88,10 +88,14 @@ KEYS = {
     "d": 0x44,
     "e": 0x45,
     "f": 0x46,
+    "f11": 0x7A,
+    "f1": 0x70,
+    "f12": 0x7B,
     "i": 0x49,
     "j": 0x4A,
     "k": 0x4B,
     "l": 0x4C,
+    "m": 0x4D,
     "o": 0x4F,
     "p": 0x50,
     "q": 0x51,
@@ -108,6 +112,11 @@ KEYS = {
     "down": 0x28,
     "left": 0x25,
     "right": 0x27,
+    "esc": 0x1B,
+    "escape": 0x1B,
+    "tab": 0x09,
+    "enter": 0x0D,
+    "alt": 0x12,
 }
 
 
@@ -174,7 +183,10 @@ def main():
     print(f"Target: {title} (0x{hwnd:08X}); holding {args.key} for {args.seconds:.2f}s")
     user32.ShowWindow(hwnd, SW_RESTORE)
     if not user32.SetForegroundWindow(hwnd):
-        raise ctypes.WinError()
+        # Windows may reject foreground transfer when another overlay owns
+        # focus.  Continue when the target was activated by the caller; the
+        # SendInput events still go to the foreground window.
+        print("Warning: could not force foreground; sending to current foreground window.")
 
     send_input_key(vk, True)
     try:

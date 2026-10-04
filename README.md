@@ -36,6 +36,16 @@ This branch adds a first reverse-engineering aid for the spectator project:
   rotates that offset with the vehicle as it steers.
 - `Ctrl+Shift+F12` performs a reversible one-unit camera-height nudge for
   diagnostics.
+- `Ctrl+Shift+F11` opens a spectator overlay. It lists validated transform
+  candidates, lets you select one without entering it, and attaches follow to
+  the selected object. The first version displays positions and addresses while
+  vehicle-name mapping is still being traced.
+
+When SnowRunner is the foreground window and freecam is active, the helper
+watches the `M`/`Esc` map boundary: it stops follow, disables freecam, and
+restores it after returning to the world. This is a short polling guard, so the
+game window must be focused before using those keys. The overlay is an external
+WinForms window positioned over the SnowRunner viewport.
 
 ## TODO
 
@@ -85,8 +95,9 @@ The validated source is `SnowRunner.exe+0x2A8EB90 -> [owner+0x08]`. Follow reads
 the active anchor from `SnowRunner.exe+0x2A8EB68 -> [root+0x28] -> [object+0x18]
 -> object+0x1A0` (stored Z,Y,X), then writes only the source matrix translation.
 The current runtime validation follows the active truck/player anchor while the
-vehicle moves and turns; multiplayer and selecting a different vehicle are not
-yet exposed.
+vehicle moves and turns. The target overlay can now select a different
+transform-shaped object without entering it; the displayed list still needs a
+runtime name mapping before it can be called a truck-only list.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each
