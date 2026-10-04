@@ -43,6 +43,7 @@ namespace SnowFlyer2
         private readonly Func<string> _attach;
         private readonly ListBox _targets = new ListBox();
         private readonly Label _status = new Label();
+        private readonly CheckBox _namedOnly = new CheckBox();
         private bool _refreshing;
 
         public TargetOverlayForm(
@@ -72,7 +73,7 @@ namespace SnowFlyer2
 
             Label title = new Label
             {
-                Text = "Spectator targets (asset name / world position)",
+                Text = "Spectator targets (named asset / world position)",
                 AutoSize = false,
                 TextAlign = ContentAlignment.MiddleLeft,
                 Dock = DockStyle.Top,
@@ -97,6 +98,9 @@ namespace SnowFlyer2
             attachButton.Click += (sender, args) => SetStatus(_attach());
             Button close = new Button { Text = "Close", Width = 90, Height = 28 };
             close.Click += (sender, args) => Close();
+            _namedOnly.Text = "Named only";
+            _namedOnly.AutoSize = true;
+            _namedOnly.CheckedChanged += (sender, args) => RefreshTargetList();
             FlowLayoutPanel controls = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
@@ -107,6 +111,7 @@ namespace SnowFlyer2
             controls.Controls.Add(refresh);
             controls.Controls.Add(attachButton);
             controls.Controls.Add(close);
+            controls.Controls.Add(_namedOnly);
             _status.Dock = DockStyle.Bottom;
             _status.Height = 28;
             _status.Padding = new Padding(8, 5, 0, 0);
@@ -161,6 +166,9 @@ namespace SnowFlyer2
                     await Task.Run(() => _refreshTargets());
                 if (IsDisposed || Disposing)
                     return;
+                int namedCount = items.Count(item => !string.IsNullOrWhiteSpace(item.Name));
+                if (_namedOnly.Checked)
+                    items = items.Where(item => !string.IsNullOrWhiteSpace(item.Name)).ToList();
                 _targets.BeginUpdate();
                 try
                 {
@@ -185,7 +193,8 @@ namespace SnowFlyer2
                 {
                     _targets.EndUpdate();
                 }
-                SetStatus($"{items.Count} transform candidates. Select one and attach.");
+                string scope = _namedOnly.Checked ? "named" : "total";
+                SetStatus($"{items.Count} {scope} candidates ({namedCount} named). Select one and attach.");
             }
             catch (Exception ex)
             {

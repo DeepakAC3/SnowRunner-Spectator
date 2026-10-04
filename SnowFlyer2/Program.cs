@@ -847,6 +847,17 @@ namespace SnowFlyer2
                 {
                     if (left.IsActive != right.IsActive)
                         return left.IsActive ? -1 : 1;
+                    bool leftNamed = !string.IsNullOrWhiteSpace(left.Name);
+                    bool rightNamed = !string.IsNullOrWhiteSpace(right.Name);
+                    if (leftNamed != rightNamed)
+                        return leftNamed ? -1 : 1;
+                    if (leftNamed)
+                    {
+                        int name = string.Compare(left.Name, right.Name,
+                            StringComparison.OrdinalIgnoreCase);
+                        if (name != 0)
+                            return name;
+                    }
                     int x = left.Position.X.CompareTo(right.Position.X);
                     if (x != 0)
                         return x;
