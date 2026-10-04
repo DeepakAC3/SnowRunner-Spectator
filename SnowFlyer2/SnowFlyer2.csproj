@@ -92,6 +92,9 @@
     <Compile Include="KeybindingConfig.cs" />
     <Compile Include="KeybindingManager.cs" />
     <Compile Include="Program.cs" />
+    <Compile Include="SpectatorBridge.cs" />
+    <Compile Include="SpectatorUiLoader.cs" />
+    <Compile Include="SpectatorDiagnostics.cs" />
     <Compile Include="TargetOverlayForm.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>

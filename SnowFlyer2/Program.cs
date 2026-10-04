@@ -15,7 +15,7 @@ using System.Text;
 namespace SnowFlyer2
 {
 
-    class Program
+    partial class Program
     {
         /// <summary>
         /// Original code
@@ -117,6 +117,20 @@ namespace SnowFlyer2
         private static volatile bool FaceTruckEnabled;
         private static volatile bool OrbitModeEnabled;
         private static DateTime LastMatrixReadbackAdjustmentLog = DateTime.MinValue;
+        // Follow diagnostics are kept independently from the worker's lifetime so
+        // the overlay (or another UI surface) can explain a stalled follow after
+        // the worker has stopped.
+        private static string CameraFollowDiagnosticStatus = "Idle";
+        private static string CameraFollowDiagnosticReason = "";
+        private static int CameraFollowConsecutiveTransientFailures;
+        private static int CameraFollowTransientFailureCount;
+        private static int CameraFollowWriteFailureCount;
+        private static int CameraFollowSkippedTickCount;
+        private static long CameraFollowTickCount;
+        private static DateTime CameraFollowDiagnosticUpdatedUtc = DateTime.UtcNow;
+        private static Vector3 CameraFollowDiagnosticSourcePosition;
+        private static Vector3 CameraFollowDiagnosticTargetPosition;
+        private static Vector3 CameraFollowDiagnosticOffset;
         private static IntPtr SelectedFollowOwner;
         private static IntPtr SelectedFollowAction;
         private static IntPtr SelectedFollowBody;
@@ -207,9 +221,21 @@ namespace SnowFlyer2
         // fixed interval after its memory reads. This keeps camera writes evenly
         // spaced when a read pass takes a little longer than usual.
         private const int CameraFollowPeriodMilliseconds = 6;
-        private const float CameraFollowPositionSmoothingSeconds = 0.045f;
-        private const float CameraFollowRotationSmoothingSeconds = 0.045f;
-        private const int CameraFollowMaxMatrixGuardSkips = 8;
+        private const float CameraFollowDefaultPositionSmoothingSeconds = 0.045f;
+        private const float CameraFollowDefaultRotationSmoothingSeconds = 0.045f;
+        private static float CameraFollowPositionSmoothingSeconds =
+            CameraFollowDefaultPositionSmoothingSeconds;
+        private static float CameraFollowRotationSmoothingSeconds =
+            CameraFollowDefaultRotationSmoothingSeconds;
+        private const int CameraFollowMaxMatrixGuardSkips = 80;
+        // A torn pointer/matrix read is expected occasionally while the game is
+        // rebuilding a frame. Keep follow alive through a short burst of those
+        // reads; a persistent failure still stops the worker deterministically.
+        private const int CameraFollowMaxTransientFailures = 80;
+        private const int CameraFollowTranslationWriteAttempts = 3;
+        private const float CameraFollowManualRebaseMaxIncrement = CameraFollowMaxIncrement;
+        private const float CameraFollowTranslationBasisGuardTolerance = 0.02f;
+        private const float CameraFollowTranslationPositionGuardTolerance = 0.20f;
         private const float CameraSourceReadbackBasisTolerance = 0.00005f;
         private const float CameraSourceReadbackTranslationResidualTolerance = CameraSourcePositionTolerance;
         private const float CameraSourceReadbackPositionTolerance = CameraSourcePositionTolerance;
@@ -217,12 +243,6 @@ namespace SnowFlyer2
         private const float CameraOrbitMaxElevation = 1.3962634f; // 80 degrees
         private const int CameraSourceStableReadAttempts = 3;
         private const int CameraSourceStableReadDelayMilliseconds = 2;
-        private const int VirtualKeyI = 0x49;
-        private const int VirtualKeyK = 0x4B;
-        private const int VirtualKeyJ = 0x4A;
-        private const int VirtualKeyL = 0x4C;
-        private const int VirtualKeyO = 0x4F;
-        private const int VirtualKeyU = 0x55;
         private const int VirtualKeyLeft = 0x25;
         private const int VirtualKeyUp = 0x26;
         private const int VirtualKeyRight = 0x27;
@@ -314,14 +334,62 @@ namespace SnowFlyer2
             public bool IsActive;
         }
 
+        // Immutable snapshot for a UI/status bridge.  Keep this type free of
+        // controls so callers can poll it from any thread.
+        internal sealed class CameraFollowDiagnosticState
+        {
+            internal CameraFollowDiagnosticState(bool isFollowing, string status,
+                string reason, int consecutiveTransientFailures,
+                int transientFailureCount, int writeFailureCount,
+                int skippedTickCount, long tickCount, DateTime updatedUtc,
+                Vector3 sourcePosition, Vector3 targetPosition, Vector3 offset,
+                bool faceTruck, bool orbitMode)
+            {
+                IsFollowing = isFollowing;
+                Status = status ?? string.Empty;
+                Reason = reason ?? string.Empty;
+                ConsecutiveTransientFailures = consecutiveTransientFailures;
+                TransientFailureCount = transientFailureCount;
+                WriteFailureCount = writeFailureCount;
+                SkippedTickCount = skippedTickCount;
+                TickCount = tickCount;
+                UpdatedUtc = updatedUtc;
+                SourcePosition = sourcePosition;
+                TargetPosition = targetPosition;
+                Offset = offset;
+                FaceTruck = faceTruck;
+                OrbitMode = orbitMode;
+            }
+
+            internal bool IsFollowing { get; }
+            internal string Status { get; }
+            internal string Reason { get; }
+            internal int ConsecutiveTransientFailures { get; }
+            internal int TransientFailureCount { get; }
+            internal int WriteFailureCount { get; }
+            internal int SkippedTickCount { get; }
+            internal long TickCount { get; }
+            internal DateTime UpdatedUtc { get; }
+            internal Vector3 SourcePosition { get; }
+            internal Vector3 TargetPosition { get; }
+            internal Vector3 Offset { get; }
+            internal bool FaceTruck { get; }
+            internal bool OrbitMode { get; }
+        }
+
         [STAThread]
         static void Main(string[] args)
         {
+            InitializeSpectatorDiagnostics();
             KeybindingManager keybindingManager = new KeybindingManager();
             KeybindingConfig config = keybindingManager.ReadKeybindingConfig();
 
             Process snowRunnerProcess = attachToSnowRunnerProcess();
             IsFreeCamActive = ReadActualFreeCamFlag(snowRunnerProcess);
+            StartSpectatorBridge(snowRunnerProcess);
+            if (args.Any(argument => string.Equals(argument, "--ingame-ui",
+                StringComparison.OrdinalIgnoreCase)))
+                LoadSpectatorUi(snowRunnerProcess);
             Task.Run(() => WatchMapTransitions(snowRunnerProcess));
             HotKeyManager.RegisterHotKey(config.ToggleFlyMode, KeyModifiers.Control);
             HotKeyManager.RegisterHotKey(config.ToggleFreezeTime, KeyModifiers.Control);
@@ -338,6 +406,14 @@ namespace SnowFlyer2
             HotKeyManager.RegisterHotKey(config.NudgeCameraPosition, KeyModifiers.Control | KeyModifiers.Shift);
             HotKeyManager.RegisterHotKey(config.ToggleTargetOverlay, KeyModifiers.Control | KeyModifiers.Shift);
             HotKeyManager.HotKeyPressed += (sender2, e2) => Hotkey_Pressed(sender2, e2, config,snowRunnerProcess);
+
+            if (args.Any(argument => string.Equals(argument, "--headless",
+                StringComparison.OrdinalIgnoreCase)))
+            {
+                while (!snowRunnerProcess.HasExited)
+                    Thread.Sleep(250);
+                return;
+            }
 
             bool showMenu = true;
             while (showMenu)
@@ -658,6 +734,7 @@ namespace SnowFlyer2
                     CameraFollowGeneration++;
                     ResetCameraFollowSmoothingLocked(default(Vector3));
                     ResetCameraOrbitLocked();
+                    RecordCameraFollowStoppedLocked("Stopped by user.");
                     Console.WriteLine("Camera follow stopped.");
                     return;
                 }
@@ -719,6 +796,10 @@ namespace SnowFlyer2
                     ResetCameraFollowSmoothingLocked(source.WorldPosition);
                     ResetCameraOrbitLocked();
                     IsFollowingPlayer = true;
+                    ResetCameraFollowDiagnosticsLocked("Starting");
+                    CameraFollowDiagnosticSourcePosition = source.WorldPosition;
+                    CameraFollowDiagnosticTargetPosition = source.WorldPosition;
+                    CameraFollowDiagnosticOffset = CameraFollowOffset;
 
                     int generation = ++CameraFollowGeneration;
                     Console.WriteLine($"Camera follow started on {target.AssetId} with offset {CameraFollowOffset.X:F2} " +
@@ -739,6 +820,136 @@ namespace SnowFlyer2
             }
         }
 
+        internal static CameraFollowDiagnosticState GetCameraFollowDiagnosticState()
+        {
+            lock (CameraWriteGate)
+            {
+                return new CameraFollowDiagnosticState(IsFollowingPlayer,
+                    CameraFollowDiagnosticStatus, CameraFollowDiagnosticReason,
+                    CameraFollowConsecutiveTransientFailures,
+                    CameraFollowTransientFailureCount,
+                    CameraFollowWriteFailureCount,
+                    CameraFollowSkippedTickCount,
+                    CameraFollowTickCount,
+                    CameraFollowDiagnosticUpdatedUtc,
+                    CameraFollowDiagnosticSourcePosition,
+                    CameraFollowDiagnosticTargetPosition,
+                    CameraFollowDiagnosticOffset,
+                    FaceTruckEnabled,
+                    OrbitModeEnabled);
+            }
+        }
+
+        internal static string GetCameraFollowStatus()
+        {
+            CameraFollowDiagnosticState state = GetCameraFollowDiagnosticState();
+            return string.IsNullOrEmpty(state.Reason)
+                ? state.Status
+                : state.Status + ": " + state.Reason;
+        }
+
+        internal static void SetCameraFollowSmoothing(float seconds)
+        {
+            if (float.IsNaN(seconds) || float.IsInfinity(seconds))
+                return;
+            float clamped = Math.Max(0.005f, Math.Min(0.5f, seconds));
+            lock (CameraWriteGate)
+            {
+                CameraFollowPositionSmoothingSeconds = clamped;
+                CameraFollowRotationSmoothingSeconds = clamped;
+                CameraFollowHasSmoothedPosition = false;
+                CameraFollowHasSmoothedForward = false;
+            }
+        }
+
+        // Reframe the selected truck while preserving the current local azimuth.
+        // Distance is the horizontal camera radius and height is the local Y
+        // offset, both in game world units.
+        internal static void SetCameraFollowFraming(float distance, float height)
+        {
+            if (float.IsNaN(distance) || float.IsInfinity(distance) ||
+                float.IsNaN(height) || float.IsInfinity(height))
+                return;
+            float clampedDistance = Math.Max(0.5f, Math.Min(500.0f, distance));
+            float clampedHeight = Math.Max(-100.0f, Math.Min(100.0f, height));
+            lock (CameraWriteGate)
+            {
+                Vector3 local = CameraFollowLocalOffset;
+                float horizontalLength = (float)Math.Sqrt(
+                    local.X * local.X + local.Z * local.Z);
+                if (horizontalLength < 0.001f)
+                {
+                    local.X = 0.0f;
+                    local.Z = clampedDistance;
+                }
+                else
+                {
+                    float scale = clampedDistance / horizontalLength;
+                    local.X *= scale;
+                    local.Z *= scale;
+                }
+                local.Y = clampedHeight;
+                CameraFollowLocalOffset = local;
+                CameraFollowHasSmoothedPosition = false;
+                CameraOrbitHasState = false;
+            }
+        }
+
+        private static void ResetCameraFollowDiagnosticsLocked(string status)
+        {
+            CameraFollowDiagnosticStatus = status ?? "Idle";
+            CameraFollowDiagnosticReason = string.Empty;
+            CameraFollowConsecutiveTransientFailures = 0;
+            CameraFollowTransientFailureCount = 0;
+            CameraFollowWriteFailureCount = 0;
+            CameraFollowSkippedTickCount = 0;
+            CameraFollowTickCount = 0;
+            CameraFollowDiagnosticSourcePosition = default(Vector3);
+            CameraFollowDiagnosticTargetPosition = default(Vector3);
+            CameraFollowDiagnosticOffset = default(Vector3);
+            CameraFollowDiagnosticUpdatedUtc = DateTime.UtcNow;
+        }
+
+        private static bool RecordCameraFollowTransientFailureLocked(string reason)
+        {
+            CameraFollowDiagnosticStatus = "Recovering";
+            CameraFollowDiagnosticReason = reason ?? "Transient follow read/write failure.";
+            CameraFollowConsecutiveTransientFailures++;
+            CameraFollowTransientFailureCount++;
+            CameraFollowSkippedTickCount++;
+            CameraFollowDiagnosticUpdatedUtc = DateTime.UtcNow;
+            return CameraFollowConsecutiveTransientFailures >=
+                CameraFollowMaxTransientFailures;
+        }
+
+        private static void RecordCameraFollowWriteFailureLocked(string reason)
+        {
+            CameraFollowWriteFailureCount++;
+            CameraFollowDiagnosticReason = reason ?? "Camera source write failed.";
+            CameraFollowDiagnosticUpdatedUtc = DateTime.UtcNow;
+        }
+
+        private static void RecordCameraFollowSuccessLocked(Vector3 sourcePosition,
+            Vector3 targetPosition, Vector3 offset)
+        {
+            CameraFollowDiagnosticStatus = "Following";
+            CameraFollowDiagnosticReason = string.Empty;
+            CameraFollowConsecutiveTransientFailures = 0;
+            CameraFollowTickCount++;
+            CameraFollowDiagnosticSourcePosition = sourcePosition;
+            CameraFollowDiagnosticTargetPosition = targetPosition;
+            CameraFollowDiagnosticOffset = offset;
+            CameraFollowDiagnosticUpdatedUtc = DateTime.UtcNow;
+        }
+
+        private static void RecordCameraFollowStoppedLocked(string reason)
+        {
+            CameraFollowDiagnosticStatus = "Stopped";
+            CameraFollowDiagnosticReason = reason ?? string.Empty;
+            CameraFollowConsecutiveTransientFailures = 0;
+            CameraFollowDiagnosticUpdatedUtc = DateTime.UtcNow;
+        }
+
         private static void ToggleTargetOverlay(Process snowRunnerProcess)
         {
             if (TargetOverlay != null && !TargetOverlay.IsDisposed)
@@ -756,7 +967,8 @@ namespace SnowFlyer2
                 value => SetOrbitModeEnabled(value),
                 () => FaceTruckEnabled,
                 () => OrbitModeEnabled,
-                snowRunnerProcess.MainWindowHandle);
+                snowRunnerProcess.MainWindowHandle,
+                () => GetCameraFollowStatus());
             TargetOverlay.FormClosed += (sender, args) => TargetOverlay = null;
             TargetOverlay.Show();
         }
@@ -827,12 +1039,19 @@ namespace SnowFlyer2
                 return;
             lock (CameraWriteGate)
             {
-                if (IsFollowingPlayer)
+                bool sameTarget = SelectedFollowOwner == target.OwnerAddress &&
+                    SelectedFollowAction == target.ActionAddress &&
+                    SelectedFollowBody == target.ChassisBodyAddress &&
+                    SelectedFollowFrame == target.FrameAddress &&
+                    string.Equals(SelectedFollowAssetId, target.AssetId,
+                        StringComparison.Ordinal);
+                if (IsFollowingPlayer && !sameTarget)
                 {
                     IsFollowingPlayer = false;
                     CameraFollowGeneration++;
                     ResetCameraFollowSmoothingLocked(default(Vector3));
                     ResetCameraOrbitLocked();
+                    RecordCameraFollowStoppedLocked("Stopped before changing target.");
                     Console.WriteLine("Camera follow stopped before changing target.");
                 }
                 SelectedFollowOwner = target.OwnerAddress;
@@ -840,8 +1059,11 @@ namespace SnowFlyer2
                 SelectedFollowBody = target.ChassisBodyAddress;
                 SelectedFollowFrame = target.FrameAddress;
                 SelectedFollowAssetId = target.AssetId;
-                ResetCameraFollowSmoothingLocked(default(Vector3));
-                ResetCameraOrbitLocked();
+                if (!sameTarget)
+                {
+                    ResetCameraFollowSmoothingLocked(default(Vector3));
+                    ResetCameraOrbitLocked();
+                }
             }
             Console.WriteLine($"Selected truck chassis {target.AssetId} {target.Address.ToInt64():X} at " +
                 $"{target.Position.X:F2} {target.Position.Y:F2} {target.Position.Z:F2}.");
@@ -913,7 +1135,7 @@ namespace SnowFlyer2
                     Vector3 attachPosition = target.Position +
                         new Vector3(0.0f, 2.0f, 0.0f) - forward * 12.0f;
                     if (!TryWriteSourceTranslation(processHandle, source.Transform,
-                            BuildTranslationBytes(source.Matrix, attachPosition)))
+                            source.Matrix, attachPosition, out _))
                         return "Attach recenter write failed validation.";
 
                     if (IsFollowingPlayer)
@@ -922,6 +1144,7 @@ namespace SnowFlyer2
                         CameraFollowGeneration++;
                         ResetCameraFollowSmoothingLocked(default(Vector3));
                         ResetCameraOrbitLocked();
+                        RecordCameraFollowStoppedLocked("Stopped before attach recenter.");
                     }
                     CameraFollowOffset = attachPosition - target.Position;
                     CameraFollowLocalOffset = WorldOffsetToLocal(CameraFollowOffset,
@@ -931,6 +1154,10 @@ namespace SnowFlyer2
                     ResetCameraFollowSmoothingLocked(attachPosition);
                     ResetCameraOrbitLocked();
                     IsFollowingPlayer = true;
+                    ResetCameraFollowDiagnosticsLocked("Starting");
+                    CameraFollowDiagnosticSourcePosition = attachPosition;
+                    CameraFollowDiagnosticTargetPosition = attachPosition;
+                    CameraFollowDiagnosticOffset = CameraFollowOffset;
                     int generation = ++CameraFollowGeneration;
                     Task.Run(() => TrackCameraFollow(snowRunnerProcess,
                         target.Owner, target.Action, target.ChassisBody, target.Frame,
@@ -1008,6 +1235,7 @@ namespace SnowFlyer2
                     CameraFollowGeneration++;
                     ResetCameraFollowSmoothingLocked(default(Vector3));
                     ResetCameraOrbitLocked();
+                    RecordCameraFollowStoppedLocked("Map transition stopped follow.");
                 }
             }
             Console.WriteLine("Map opening: follow stopped and freecam is being disabled.");
@@ -1413,6 +1641,7 @@ namespace SnowFlyer2
                     CameraFollowGeneration++;
                     ResetCameraFollowSmoothingLocked(default(Vector3));
                     ResetCameraOrbitLocked();
+                    RecordCameraFollowStoppedLocked("Stopped before camera nudge.");
                     Console.WriteLine("Camera follow stopped before camera nudge.");
                 }
             }
@@ -1541,21 +1770,38 @@ namespace SnowFlyer2
                         CameraFollowLastSampleTimestamp = now;
                         deltaSeconds = Math.Max(0.001f, Math.Min(0.10f, deltaSeconds));
 
-                        CameraSourceSnapshot source;
+                        CameraSourceSnapshot source = default(CameraSourceSnapshot);
+                        TruckTargetSnapshot target = null;
+                        bool transientFailure = false;
+                        bool skipTick = false;
+                        string transientReason = null;
                         if (!TryReadTruckScanIdentity(processHandle, moduleBase,
                                 out IntPtr activeOwner, out IntPtr actionVtable,
-                                out IntPtr chassisVtable) ||
-                            !TryReadValidatedTruckOwner(processHandle, targetOwner,
+                                out IntPtr chassisVtable))
+                        {
+                            transientFailure = true;
+                            transientReason = "Truck identity read was temporarily unavailable.";
+                        }
+                        else if (!TryReadValidatedTruckOwner(processHandle, targetOwner,
                                 actionVtable, chassisVtable, activeOwner,
-                                out TruckTargetSnapshot target) ||
-                            target.Action != expectedAction ||
+                                out target))
+                        {
+                            transientFailure = true;
+                            transientReason = "Validated truck snapshot was temporarily unavailable.";
+                        }
+                        else if (target.Action != expectedAction ||
                             target.ChassisBody != expectedBody ||
                             target.Frame != expectedFrame ||
                             !string.Equals(target.AssetId, expectedAssetId,
-                                StringComparison.Ordinal) ||
-                            !TryReadCameraSourceSnapshot(processHandle, moduleBase, false, false, out source))
+                                StringComparison.Ordinal))
                         {
                             failure = "Camera follow target identity changed; follow stopped.";
+                        }
+                        else if (!TryReadCameraSourceSnapshot(processHandle, moduleBase,
+                            false, false, out source))
+                        {
+                            transientFailure = true;
+                            transientReason = "Camera source snapshot was temporarily unavailable.";
                         }
                         else if (source.Transform != expectedTransform)
                         {
@@ -1564,15 +1810,54 @@ namespace SnowFlyer2
                         else if (hasPreviousPlayer &&
                             Vector3.Distance(target.Position, previousPlayer) > CameraFollowMaxTruckJump)
                         {
-                            failure = "Truck position jumped too far; follow stopped before writing.";
+                            // A single 64-byte transform read can straddle the
+                            // game's physics update. Confirm a large jump before
+                            // treating it as a real teleport or identity fault.
+                            if (TryReadValidatedTruckOwner(processHandle, targetOwner,
+                                    actionVtable, chassisVtable, activeOwner,
+                                    out TruckTargetSnapshot retryTarget) &&
+                                retryTarget.Action == expectedAction &&
+                                retryTarget.ChassisBody == expectedBody &&
+                                retryTarget.Frame == expectedFrame &&
+                                string.Equals(retryTarget.AssetId, expectedAssetId,
+                                    StringComparison.Ordinal) &&
+                                Vector3.Distance(retryTarget.Position, previousPlayer) <=
+                                    CameraFollowMaxTruckJump)
+                            {
+                                target = retryTarget;
+                            }
+                            else
+                            {
+                                failure = "Truck position jumped too far; follow stopped before writing.";
+                            }
                         }
-                        else
+
+                        if (transientFailure)
                         {
-                            if (CameraFollowHasLastRequested && NativeTranslationKeyHeld())
+                            if (RecordCameraFollowTransientFailureLocked(transientReason))
+                            {
+                                failure = "Camera follow stopped after repeated transient read failures: " +
+                                    transientReason;
+                            }
+                            else
+                            {
+                                skipTick = true;
+                            }
+                        }
+
+                        if (!skipTick && failure == null)
+                        {
+                            // Rebase against any bounded native camera movement,
+                            // even if the key was released between follow ticks.
+                            // Sampling GetAsyncKeyState here used to miss short
+                            // I/K/J/L/O/U presses and the smoothing filter would
+                            // pull the camera back to its old offset on the next
+                            // successful tick.
+                            if (CameraFollowHasLastRequested)
                             {
                                 Vector3 residual = source.WorldPosition - CameraFollowLastRequested;
                                 float residualLength = residual.Length();
-                                if (residualLength > CameraFollowMaxIncrement)
+                                if (residualLength > CameraFollowManualRebaseMaxIncrement)
                                     failure = "Native camera movement exceeded the per-frame follow bound.";
                                 else if (residualLength > CameraFollowNoiseThreshold)
                                 {
@@ -1607,6 +1892,18 @@ namespace SnowFlyer2
                             Vector3 increment = targetPosition - source.WorldPosition;
                             byte[] lookAtMatrix = null;
                             bool matrixGuardMismatch = false;
+                            if (failure == null && increment.Length() > CameraFollowMaxIncrement &&
+                                TryReadCameraSourceSnapshot(processHandle, moduleBase, false, true,
+                                    out CameraSourceSnapshot stableSource) &&
+                                stableSource.Transform == expectedTransform)
+                            {
+                                // Confirm an apparent far jump against a stable
+                                // matrix before stopping. This filters a torn
+                                // source read while retaining the hard movement
+                                // bound for a real source discontinuity.
+                                source = stableSource;
+                                increment = targetPosition - source.WorldPosition;
+                            }
                             if (failure == null && increment.Length() > CameraFollowMaxIncrement)
                             {
                                 failure = "Camera follow increment exceeded the per-frame bound.";
@@ -1625,6 +1922,11 @@ namespace SnowFlyer2
                                 if (matrixGuardMismatch)
                                 {
                                     matrixGuardMismatchCount++;
+                                    RecordCameraFollowWriteFailureLocked(
+                                        "Camera source matrix changed during look-at write; retrying.");
+                                    RecordCameraFollowTransientFailureLocked(
+                                        CameraFollowDiagnosticReason);
+                                    skipTick = true;
                                     if (matrixGuardMismatchCount >= CameraFollowMaxMatrixGuardSkips)
                                         failure = "Camera source matrix changed repeatedly before look-at write.";
                                 }
@@ -1633,17 +1935,34 @@ namespace SnowFlyer2
                                     failure = "Camera follow could not write the validated source matrix.";
                                 }
                             }
-                            else if (failure == null && !FaceTruckEnabled &&
-                                !TryWriteSourceTranslation(processHandle, source.Transform,
-                                    BuildTranslationBytes(source.Matrix, targetPosition)))
+                            else if (failure == null && !FaceTruckEnabled)
                             {
-                                failure = "Camera follow could not write the validated source transform.";
+                                bool translationGuardMismatch;
+                                if (!TryWriteSourceTranslation(processHandle, source.Transform,
+                                    source.Matrix, targetPosition, out translationGuardMismatch))
+                                {
+                                    RecordCameraFollowWriteFailureLocked(
+                                        translationGuardMismatch
+                                            ? "Camera source basis changed during translation write; retrying."
+                                            : "Camera source translation write was temporarily unavailable.");
+                                    if (RecordCameraFollowTransientFailureLocked(
+                                        CameraFollowDiagnosticReason))
+                                    {
+                                        failure = "Camera follow stopped after repeated source translation write failures.";
+                                    }
+                                    else
+                                    {
+                                        skipTick = true;
+                                    }
+                                }
                             }
-                            else if (failure == null)
+                            if (!skipTick && failure == null)
                             {
                                 matrixGuardMismatchCount = 0;
                                 CameraFollowLastRequested = targetPosition;
                                 CameraFollowHasLastRequested = true;
+                                RecordCameraFollowSuccessLocked(source.WorldPosition,
+                                    targetPosition, CameraFollowOffset);
                                 if ((DateTime.UtcNow - lastStatus).TotalSeconds >= 1.0)
                                 {
                                     Console.WriteLine($"FOLLOW {target.AssetId} source {source.WorldPosition.X:F2} " +
@@ -1665,6 +1984,7 @@ namespace SnowFlyer2
 
                         if (failure != null)
                         {
+                            RecordCameraFollowStoppedLocked(failure);
                             StopCameraFollowLocked(generation);
                         }
                     }
@@ -1994,6 +2314,8 @@ namespace SnowFlyer2
                 CameraFollowGeneration++;
                 ResetCameraFollowSmoothingLocked(default(Vector3));
                 ResetCameraOrbitLocked();
+                if (CameraFollowDiagnosticStatus != "Stopped")
+                    RecordCameraFollowStoppedLocked(CameraFollowDiagnosticReason);
             }
         }
 
@@ -2004,6 +2326,8 @@ namespace SnowFlyer2
             {
                 stopped = IsFollowingPlayer && CameraFollowGeneration == generation;
                 StopCameraFollowLocked(generation);
+                if (stopped)
+                    RecordCameraFollowStoppedLocked(message);
             }
             if (stopped)
                 Console.WriteLine(message);
@@ -2201,6 +2525,188 @@ namespace SnowFlyer2
             return false;
         }
 
+        // Follow's default path preserves the native camera basis.  The game can
+        // rebuild that basis on the same frame that we write the translation, so
+        // computing bytes once from the earlier snapshot can place the camera at
+        // a distant, perfectly valid point.  Re-read the full matrix around the
+        // translation write and recompute against the newest basis when needed.
+        private static bool TryWriteSourceTranslation(
+            IntPtr processHandle, IntPtr transform, float[] expectedPrior,
+            Vector3 targetWorld, out bool guardMismatch)
+        {
+            guardMismatch = false;
+            if (!IsFiniteVector(targetWorld) || !IsValidCameraPointer(transform.ToInt64()))
+                return false;
+
+            IntPtr translationAddress = new IntPtr(
+                transform.ToInt64() + CameraSourceTranslationOffset);
+            Vector3 targetZyx = WorldToStored(targetWorld);
+            bool enforceExpectedPrior = expectedPrior != null &&
+                expectedPrior.Length == 16;
+            for (int attempt = 0; attempt < CameraFollowTranslationWriteAttempts;
+                attempt++)
+            {
+                byte[] beforeBytes = new byte[CameraSourceMatrixSize];
+                if (!TryReadBytes(processHandle, transform, beforeBytes))
+                    return false;
+                float[] before = MatrixFloats(beforeBytes);
+                if (!TryReconstructSourcePosition(before,
+                    out Vector3 beforeZyx))
+                    return false;
+                if (enforceExpectedPrior &&
+                    MaxAbsDifference(before, expectedPrior) >
+                        CameraSourceMatrixGuardTolerance)
+                {
+                    // The source moved between the guarded snapshot and this
+                    // write. Rebase the guard to the newest complete matrix and
+                    // retry; never write bytes derived from the stale snapshot.
+                    guardMismatch = true;
+                    expectedPrior = before;
+                    continue;
+                }
+                enforceExpectedPrior = false;
+
+                byte[] translation = BuildTranslationBytes(before, targetWorld);
+                if (!TryWriteBytes(processHandle, translationAddress, translation))
+                {
+                    TryRestoreSourcePosition(processHandle, transform, beforeZyx,
+                        out _);
+                    return false;
+                }
+
+                byte[] afterBytes = new byte[CameraSourceMatrixSize];
+                if (!TryReadBytes(processHandle, transform, afterBytes))
+                {
+                    guardMismatch = true;
+                    if (!TryRestoreSourcePosition(processHandle, transform,
+                        beforeZyx, out _))
+                        return false;
+                    continue;
+                }
+                float[] after = MatrixFloats(afterBytes);
+                if (!TryReconstructSourcePosition(after,
+                    out Vector3 afterZyx))
+                {
+                    guardMismatch = true;
+                    if (!TryRestoreSourcePosition(processHandle, transform,
+                        beforeZyx, out _))
+                        return false;
+                    continue;
+                }
+
+                // Basis changes are expected while the player rotates. Recompute
+                // from the newest coherent matrix instead of restoring the old
+                // world position through a newly changed basis. Restoring the
+                // stale position here can fight the game's rotation update and
+                // make the camera appear frozen or jump far away. The next
+                // attempt is guarded by the matrix we just observed.
+                if (MaxAbsBasisDifference(before, after) >
+                    CameraFollowTranslationBasisGuardTolerance ||
+                    MaxAbsDifference(afterZyx, targetZyx) >
+                    CameraFollowTranslationPositionGuardTolerance)
+                {
+                    guardMismatch = true;
+                    expectedPrior = after;
+                    enforceExpectedPrior = true;
+                    continue;
+                }
+
+                if (!TryInvalidateSourceCaches(processHandle, transform))
+                {
+                    guardMismatch = true;
+                    if (!TryRestoreSourcePosition(processHandle, transform,
+                        beforeZyx, out _))
+                        return false;
+                    continue;
+                }
+
+                // Verify the coherent position after cache invalidation. This
+                // prevents a raw 12-byte readback from being treated as success
+                // when the game's matrix writer won the race.
+                byte[] verifiedBytes = new byte[CameraSourceMatrixSize];
+                if (!TryReadBytes(processHandle, transform, verifiedBytes))
+                {
+                    guardMismatch = true;
+                    if (!TryRestoreSourcePosition(processHandle, transform,
+                        beforeZyx, out _))
+                        return false;
+                    continue;
+                }
+                float[] verified = MatrixFloats(verifiedBytes);
+                if (!TryReconstructSourcePosition(verified,
+                    out Vector3 verifiedZyx) ||
+                    MaxAbsDifference(verifiedZyx, targetZyx) >
+                    CameraFollowTranslationPositionGuardTolerance)
+                {
+                    guardMismatch = true;
+                    if (!TryRestoreSourcePosition(processHandle, transform,
+                        beforeZyx, out _))
+                        return false;
+                    continue;
+                }
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryRestoreSourcePosition(IntPtr processHandle,
+            IntPtr transform, Vector3 restoreZyx, out bool guardMismatch)
+        {
+            guardMismatch = false;
+            Vector3 restoreWorld = new Vector3(restoreZyx.Z, restoreZyx.Y,
+                restoreZyx.X);
+            IntPtr translationAddress = new IntPtr(
+                transform.ToInt64() + CameraSourceTranslationOffset);
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                byte[] currentBytes = new byte[CameraSourceMatrixSize];
+                if (!TryReadBytes(processHandle, transform, currentBytes))
+                    return false;
+                float[] current = MatrixFloats(currentBytes);
+                if (!TryReconstructSourcePosition(current, out _))
+                    return false;
+                byte[] restoreTranslation = BuildTranslationBytes(current,
+                    restoreWorld);
+                if (!TryWriteBytes(processHandle, translationAddress,
+                    restoreTranslation))
+                    return false;
+
+                byte[] readbackBytes = new byte[CameraSourceMatrixSize];
+                if (!TryReadBytes(processHandle, transform, readbackBytes))
+                {
+                    guardMismatch = true;
+                    continue;
+                }
+                float[] readback = MatrixFloats(readbackBytes);
+                if (!TryReconstructSourcePosition(readback,
+                    out Vector3 readbackZyx) ||
+                    MaxAbsDifference(readbackZyx, restoreZyx) >
+                        CameraFollowTranslationPositionGuardTolerance)
+                {
+                    guardMismatch = true;
+                    continue;
+                }
+                if (TryInvalidateSourceCaches(processHandle, transform))
+                    return true;
+                guardMismatch = true;
+            }
+            Console.WriteLine("Camera source translation rollback could not be verified.");
+            return false;
+        }
+
+        private static float MaxAbsBasisDifference(float[] first, float[] second)
+        {
+            if (first == null || second == null || first.Length != 16 ||
+                second.Length != 16)
+                return float.PositiveInfinity;
+            int[] basisIndices = { 0, 1, 2, 4, 5, 6, 8, 9, 10 };
+            float result = 0.0f;
+            foreach (int index in basisIndices)
+                result = Math.Max(result, Math.Abs(first[index] - second[index]));
+            return result;
+        }
+
         private static bool TryInvalidateSourceCaches(IntPtr processHandle, IntPtr transform)
         {
             bool cacheA = TryWriteBytes(processHandle,
@@ -2215,16 +2721,6 @@ namespace SnowFlyer2
             return buffer != null && buffer.Length > 0 &&
                 WriteProcessMemory(processHandle, address, buffer, buffer.Length,
                     out IntPtr bytesWritten) && bytesWritten.ToInt64() == buffer.Length;
-        }
-
-        private static bool NativeTranslationKeyHeld()
-        {
-            return (GetAsyncKeyState(VirtualKeyI) & 0x8000) != 0 ||
-                   (GetAsyncKeyState(VirtualKeyK) & 0x8000) != 0 ||
-                   (GetAsyncKeyState(VirtualKeyJ) & 0x8000) != 0 ||
-                   (GetAsyncKeyState(VirtualKeyL) & 0x8000) != 0 ||
-                   (GetAsyncKeyState(VirtualKeyO) & 0x8000) != 0 ||
-                   (GetAsyncKeyState(VirtualKeyU) & 0x8000) != 0;
         }
 
         private static void ProbeCameraTransform(Process snowRunnerProcess)

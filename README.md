@@ -13,6 +13,29 @@ When Snowrunner is running, follow the prompts to toggle free camera mode.
 
 The mod creates a config file `keybinds.json` for power users to configure the hotkeys.
 
+## Building the spectator helper and in-game menu
+
+With Visual Studio 2022 Build Tools (MSVC, Windows SDK, and .NET Framework 4.7.2
+targeting pack) installed, run `tools/build_spectator.ps1`. It builds the x64
+helper and `SpectatorUI.dll` together in `bin/Spectator`. Launch with
+`tools/run_spectator.ps1` while SnowRunner is running.
+
+The native menu draws through the game's D3D11 swap chain. `Delete` opens or
+closes it. Refresh lists validated trucks on the loaded map; select a truck and
+press Spectate. Face truck and Orbit remain optional. The menu also provides
+distance, height, smoothing, and Free camera controls. Closing the menu leaves
+a compact follow status display. The list contains trucks, not player names;
+co-op player identity mapping is still an investigation item.
+
+The helper loads this DLL into the running game with `--ingame-ui`; an ASI loader
+is not required. The DLL stays loaded until the game exits and reconnects if the
+helper restarts. Camera memory access remains in the helper. The native UI
+exchanges bounded commands and state over a local pipe tied to the game PID.
+The external picker remains available through `Ctrl+Shift+F11`.
+
+Each helper run writes a timestamped log beside the executable in `logs`. The
+picker and native UI report Following, Recovering, or Stopped with the reason.
+
 ## Spectator prototype
 
 This branch adds a first reverse-engineering aid for the spectator project:
@@ -146,6 +169,20 @@ Orbit azimuth verification also passed: holding `Right` for 0.4 seconds moved
 the camera 7.82 m around a stationary truck while preserving a 12.958 m radius
 and settling at 0 degrees aim error. Co-op moving follow and injected failure
 branches remain untested.
+
+Release11 hardens default follow while Face truck and Orbit are off. Translation
+is recomputed against the current native camera basis, checked before and after
+the write, and restored to the prior world position if verification fails.
+Brief unavailable truck/camera reads defer writes and retry for up to 80
+consecutive failed ticks. A confirmed identity change still stops follow.
+
+Live default-mode rotation verification collected 785 samples while holding
+native `P` then `Y`. The camera remained 12.622 m from the stationary CK1500;
+the maximum rendered position step was 0.000309 m and follow remained active.
+This verifies the rotation case that previously left the camera approximately
+270 m from the truck. The separate 15-second user-drive capture contained no
+truck movement, so it does not verify moving follow with this build. Native UI
+rendering and interactions still require live verification after compilation.
 
 For the camera scan, press `Ctrl+F6` once, move the free camera, then press
 `Ctrl+F6` again. Continue moving the camera and pressing `Ctrl+F6`; each

@@ -31,6 +31,7 @@ user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.ShowWindow.restype = wintypes.BOOL
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.GetForegroundWindow.restype = wintypes.HWND
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 
 
@@ -182,11 +183,11 @@ def main():
     vk = KEYS[args.key]
     print(f"Target: {title} (0x{hwnd:08X}); holding {args.key} for {args.seconds:.2f}s")
     user32.ShowWindow(hwnd, SW_RESTORE)
-    if not user32.SetForegroundWindow(hwnd):
-        # Windows may reject foreground transfer when another overlay owns
-        # focus.  Continue when the target was activated by the caller; the
-        # SendInput events still go to the foreground window.
-        print("Warning: could not force foreground; sending to current foreground window.")
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.15)
+    if user32.GetForegroundWindow() != hwnd:
+        print("SnowRunner did not receive foreground; no key input sent.")
+        return 1
 
     send_input_key(vk, True)
     try:

@@ -51,9 +51,12 @@ namespace SnowFlyer2
         private readonly Action<bool> _setOrbitMode;
         private readonly Func<bool> _getFaceTruck;
         private readonly Func<bool> _getOrbitMode;
+        private readonly Func<string> _getFollowStatus;
+        private readonly Timer _statusTimer = new Timer { Interval = 250 };
         private readonly ListBox _targets = new ListBox();
         private readonly Label _status = new Label();
         private bool _refreshing;
+        private string _lastFollowStatus;
 
         public TargetOverlayForm(
             Func<IReadOnlyList<FollowTargetInfo>> refreshTargets,
@@ -63,7 +66,8 @@ namespace SnowFlyer2
             Action<bool> setOrbitMode,
             Func<bool> getFaceTruck,
             Func<bool> getOrbitMode,
-            IntPtr gameWindow)
+            IntPtr gameWindow,
+            Func<string> getFollowStatus = null)
         {
             _refreshTargets = refreshTargets;
             _selectTarget = selectTarget;
@@ -72,6 +76,7 @@ namespace SnowFlyer2
             _setOrbitMode = setOrbitMode;
             _getFaceTruck = getFaceTruck;
             _getOrbitMode = getOrbitMode;
+            _getFollowStatus = getFollowStatus;
 
             Text = "SnowRunner Spectator Targets";
             FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -112,7 +117,12 @@ namespace SnowFlyer2
             Button refresh = new Button { Text = "Refresh", Width = 90, Height = 28 };
             refresh.Click += (sender, args) => RefreshTargetList();
             Button attachButton = new Button { Text = "Attach / follow", Width = 120, Height = 28 };
-            attachButton.Click += (sender, args) => SetStatus(_attach());
+            attachButton.Click += (sender, args) =>
+            {
+                string result = _attach();
+                Console.WriteLine("Spectator attach: " + result);
+                SetStatus(result);
+            };
             Button close = new Button { Text = "Close", Width = 90, Height = 28 };
             close.Click += (sender, args) => Close();
             CheckBox faceTruck = new CheckBox
@@ -203,6 +213,20 @@ namespace SnowFlyer2
                 }
             };
             Shown += (sender, args) => RefreshTargetList();
+            _statusTimer.Tick += (sender, args) =>
+            {
+                if (!_refreshing && _getFollowStatus != null)
+                {
+                    string status = _getFollowStatus();
+                    if (status != _lastFollowStatus)
+                    {
+                        _lastFollowStatus = status;
+                        SetStatus(status);
+                    }
+                }
+            };
+            Shown += (sender, args) => _statusTimer.Start();
+            FormClosed += (sender, args) => _statusTimer.Dispose();
         }
 
         private void SetOverlayPosition(IntPtr gameWindow)
