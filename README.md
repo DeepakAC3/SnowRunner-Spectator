@@ -21,8 +21,11 @@ helper and `SpectatorUI.dll` together in `bin/Spectator`. Launch with
 `tools/run_spectator.ps1` while SnowRunner is running.
 
 The native menu draws through the game's D3D11 swap chain. `Delete` opens or
-closes it. Refresh lists validated trucks on the loaded map; select a truck and
-press Spectate. Face truck remains optional. While following with the menu
+closes it. Refresh lists validated trucks on the loaded map. Use Search trucks
+to filter names without rescanning. Clear restores the full list;
+Spectate is disabled when your selected truck is hidden by the search. Typing
+in the search field captures keyboard input and suspends the helper's map-key
+guard. Select a visible truck and press Spectate. Face truck remains optional. While following with the menu
 closed, hold the right mouse button and drag, or use the controller right stick,
 to move around the truck. Releasing the control keeps the new offset. The menu
 also provides distance, height, and smoothing controls. Freecamera is an On/Off

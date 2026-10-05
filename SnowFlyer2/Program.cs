@@ -314,6 +314,9 @@ namespace SnowFlyer2
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr GetPropW(IntPtr window, string name);
+
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr windowHandle, out uint processId);
 
@@ -1226,6 +1229,36 @@ namespace SnowFlyer2
                     bool mapDown = GetAsyncKeyState(VirtualKeyM) < 0;
                     bool escapeDown = GetAsyncKeyState(VirtualKeyEscape) < 0;
                     bool enterDown = GetAsyncKeyState(VirtualKeyEnter) < 0;
+                    bool editingText;
+                    lock (CameraWriteGate)
+                    {
+                        long searchOwnership = GetPropW(GetForegroundWindow(),
+                            "SnowRunnerSpectator.SearchEditing").ToInt64();
+                        editingText = (searchOwnership & 1) != 0;
+                        // Consumed map keys remain owned through release even
+                        // when Enter/Esc deactivates the text field this frame.
+                        if ((searchOwnership & 2) != 0) MapKeyWasDown = mapDown;
+                        if ((searchOwnership & 4) != 0) EscapeKeyWasDown = escapeDown;
+                        if ((searchOwnership & 8) != 0)
+                        {
+                            EnterKeyWasDown = enterDown;
+                            MapFirstEnterTimestamp = 0;
+                        }
+                        if (editingText)
+                        {
+                            // Text editing owns these keys. Sample held state so
+                            // leaving the field cannot replay a held map key.
+                            MapKeyWasDown = mapDown;
+                            EscapeKeyWasDown = escapeDown;
+                            EnterKeyWasDown = enterDown;
+                            MapFirstEnterTimestamp = 0;
+                        }
+                    }
+                    if (editingText)
+                    {
+                        Thread.Sleep(5);
+                        continue;
+                    }
                     if (mapDown && !MapKeyWasDown)
                     {
                         lock (CameraWriteGate)

@@ -119,6 +119,7 @@ std::atomic<bool> g_connected{ false };
 std::atomic<bool> g_menuVisible{ true };
 std::atomic<bool> g_captureMouse{ false };
 std::atomic<bool> g_captureKeyboard{ false };
+std::atomic<bool> g_searchEditing{ false };
 std::atomic<bool> g_followActive{ false };
 std::atomic<bool> g_dragOwned{ false };
 std::mutex g_gestureMutex;
@@ -162,6 +163,61 @@ float g_uiHeight = 3.0f;
 float g_uiSmoothing = 120.0f;
 uint64_t g_uiSelectedOwner = 0;
 uint64_t g_uiAuthoritativeOwner = 0;
+std::array<char, 128> g_uiTruckSearch{};
+constexpr wchar_t kSearchEditingProperty[] = L"SnowRunnerSpectator.SearchEditing";
+std::mutex g_searchOwnershipMutex;
+uintptr_t g_consumedMapKeys = 0; // M=2, Escape=4, Enter=8; search active=1.
+
+void PublishSearchOwnershipLocked(bool editing)
+{
+    HWND window = g_window.load(std::memory_order_acquire);
+    editing = editing && window && GetForegroundWindow() == window &&
+        g_menuVisible.load(std::memory_order_acquire);
+    if (GetAsyncKeyState('M') >= 0) g_consumedMapKeys &= ~uintptr_t(2);
+    if (GetAsyncKeyState(VK_ESCAPE) >= 0) g_consumedMapKeys &= ~uintptr_t(4);
+    if (GetAsyncKeyState(VK_RETURN) >= 0) g_consumedMapKeys &= ~uintptr_t(8);
+    const uintptr_t ownership = (editing ? 1u : 0u) | g_consumedMapKeys;
+    if (window)
+    {
+        if (ownership != 0)
+            SetPropW(window, kSearchEditingProperty, reinterpret_cast<HANDLE>(ownership));
+        else
+            RemovePropW(window, kSearchEditingProperty);
+    }
+    g_searchEditing.store(editing, std::memory_order_release);
+}
+
+void SetSearchEditing(bool editing)
+{
+    std::lock_guard<std::mutex> lock(g_searchOwnershipMutex);
+    PublishSearchOwnershipLocked(editing);
+}
+
+void ClearSearchOwnership()
+{
+    std::lock_guard<std::mutex> lock(g_searchOwnershipMutex);
+    g_consumedMapKeys = 0;
+    PublishSearchOwnershipLocked(false);
+}
+
+void CaptureSearchMapKey(WPARAM key)
+{
+    std::lock_guard<std::mutex> lock(g_searchOwnershipMutex);
+    if (!g_searchEditing.load(std::memory_order_acquire))
+        return;
+    if (key == 'M') g_consumedMapKeys |= 2;
+    if (key == VK_ESCAPE) g_consumedMapKeys |= 4;
+    if (key == VK_RETURN) g_consumedMapKeys |= 8;
+    PublishSearchOwnershipLocked(true);
+}
+
+std::string LowerAscii(std::string text)
+{
+    for (char& character : text)
+        if (character >= 'A' && character <= 'Z')
+            character = static_cast<char>(character - 'A' + 'a');
+    return text;
+}
 
 LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 HRESULT __stdcall HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags);
@@ -614,6 +670,7 @@ void DrawMenu(State state)
     ImGui::SetNextWindowBgAlpha(0.94f);
     if (!ImGui::Begin("SnowRunner Spectator", nullptr, ImGuiWindowFlags_NoCollapse))
     {
+        SetSearchEditing(false);
         ImGui::End();
         return;
     }
@@ -625,27 +682,48 @@ void DrawMenu(State state)
         ImGui::TextWrapped("%s", state.status.c_str());
 
     ImGui::Separator();
-    ImGui::Text("Validated trucks (%u)", static_cast<unsigned>(state.targets.size()));
+    ImGui::SetNextItemWidth(-70.0f);
+    ImGui::InputTextWithHint("##TruckSearch", "Search trucks...", g_uiTruckSearch.data(), g_uiTruckSearch.size());
+    SetSearchEditing(ImGui::IsItemActive());
+    ImGui::SameLine();
+    if (ImGui::Button("Clear"))
+        g_uiTruckSearch.fill('\0');
+    const std::string query = LowerAscii(g_uiTruckSearch.data());
+    const auto matchesSearch = [&query](const Target& target)
+    {
+        return query.empty() || LowerAscii(target.asset.empty() ? "truck" : target.asset).find(query) != std::string::npos;
+    };
+    const auto visibleCount = std::count_if(state.targets.begin(), state.targets.end(), matchesSearch);
+    ImGui::Text("Validated trucks (%u / %u)", static_cast<unsigned>(visibleCount), static_cast<unsigned>(state.targets.size()));
     ImGui::BeginChild("TruckList", ImVec2(0, 260), true);
+    bool selectedTruckVisible = false;
     for (const Target& target : state.targets)
     {
+        if (!matchesSearch(target))
+            continue;
         std::string name = target.asset.empty() ? "truck" : target.asset;
         name += "##" + std::to_string(target.owner);
         bool selected = (g_uiSelectedOwner == target.owner);
         if (ImGui::Selectable(name.c_str(), selected))
             g_uiSelectedOwner = target.owner;
+        if (g_uiSelectedOwner == target.owner)
+            selectedTruckVisible = true;
         if (selected && ImGui::IsItemHovered())
         {
             ImGui::SetTooltip("Position %.1f, %.1f, %.1f", target.x, target.y, target.z);
         }
     }
+    if (visibleCount == 0)
+        ImGui::TextUnformatted(query.empty() ? "No trucks available. Press Refresh." : "No trucks match your search.");
     ImGui::EndChild();
 
     if (ImGui::Button("Refresh", ImVec2(100, 30)))
         QueueCommand(1);
     ImGui::SameLine();
-    if (ImGui::Button("Spectate", ImVec2(110, 30)) && g_uiSelectedOwner != 0)
+    ImGui::BeginDisabled(!selectedTruckVisible);
+    if (ImGui::Button("Spectate", ImVec2(110, 30)) && selectedTruckVisible)
         QueueCommand(2, g_uiSelectedOwner);
+    ImGui::EndDisabled();
     ImGui::SameLine();
     const bool freeCameraOn = (state.flags & kFreeCam) != 0;
     if (freeCameraOn)
@@ -694,7 +772,10 @@ void DrawFrame()
     if (g_menuVisible.load(std::memory_order_acquire))
         DrawMenu(state);
     else
+    {
+        SetSearchEditing(false);
         DrawHud(state);
+    }
 
     ImGuiIO& io = ImGui::GetIO();
     g_captureMouse.store(g_menuVisible.load(std::memory_order_acquire) && io.WantCaptureMouse, std::memory_order_release);
@@ -738,6 +819,7 @@ void DrawFrame()
 
 void ReleaseImGui()
 {
+    ClearSearchOwnership();
     ClearMouseGesture();
     g_imguiReady.store(false, std::memory_order_release);
     g_captureMouse.store(false, std::memory_order_release);
@@ -810,6 +892,7 @@ LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
     // Focus loss must be processed even after the foreground window changes.
     if (message == WM_KILLFOCUS || (message == WM_ACTIVATEAPP && !wParam))
     {
+        ClearSearchOwnership();
         ClearMouseGesture();
         g_captureMouse.store(false, std::memory_order_release);
         g_captureKeyboard.store(false, std::memory_order_release);
@@ -826,6 +909,7 @@ LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
     if (message == WM_KEYDOWN && wParam == VK_DELETE && (lParam & (1ll << 30)) == 0)
     {
         g_menuVisible.store(!g_menuVisible.load(std::memory_order_acquire), std::memory_order_release);
+        SetSearchEditing(false);
         ClearMouseGesture();
         g_captureMouse.store(false, std::memory_order_release);
         g_captureKeyboard.store(false, std::memory_order_release);
@@ -918,12 +1002,37 @@ LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
     else
         ClearMouseGesture();
 
+    // ImGui text uses the legacy key/character messages below. Withhold raw
+    // presses while editing, but forward releases so keys the game already
+    // owned before the field gained focus cannot remain stuck.
+    if (message == WM_INPUT && g_menuVisible.load(std::memory_order_acquire) &&
+        g_captureKeyboard.load(std::memory_order_acquire))
+    {
+        RAWINPUT input{};
+        UINT size = sizeof(input);
+        const UINT read = GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT,
+            &input, &size, sizeof(RAWINPUTHEADER));
+        if (read != static_cast<UINT>(-1) &&
+            read >= offsetof(RAWINPUT, data) + sizeof(RAWKEYBOARD) &&
+            input.header.dwType == RIM_TYPEKEYBOARD &&
+            (input.data.keyboard.Flags & RI_KEY_BREAK) == 0)
+        {
+            CaptureSearchMapKey(input.data.keyboard.VKey);
+            if (GET_RAWINPUT_CODE_WPARAM(wParam) == RIM_INPUT)
+                DefWindowProcW(hwnd, message, wParam, lParam);
+            return 0;
+        }
+    }
+
     const bool focusMessage = message == WM_KILLFOCUS || message == WM_SETFOCUS;
     const bool mouseMessage = message >= WM_MOUSEFIRST && message <= WM_MOUSELAST;
     const bool keyboardMessage = (message >= WM_KEYFIRST && message <= WM_KEYLAST) ||
                                  message == WM_CHAR || message == WM_SYSCHAR;
     if (g_menuVisible.load(std::memory_order_acquire) && (mouseMessage || keyboardMessage || focusMessage))
     {
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            g_captureKeyboard.load(std::memory_order_acquire))
+            CaptureSearchMapKey(wParam);
         std::lock_guard<std::mutex> lock(g_messageMutex);
         // Coalesce motion, but always retain releases/focus events. A busy
         // frame must never leave an ImGui button held indefinitely.
@@ -932,7 +1041,8 @@ LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         else if (message != WM_MOUSEMOVE || g_messages.size() < 256)
             g_messages.push_back({ hwnd, message, wParam, lParam });
         if ((mouseMessage && g_captureMouse.load(std::memory_order_acquire)) ||
-            (keyboardMessage && g_captureKeyboard.load(std::memory_order_acquire)))
+            (keyboardMessage && message != WM_KEYUP && message != WM_SYSKEYUP &&
+                g_captureKeyboard.load(std::memory_order_acquire)))
             return 0;
     }
     return forward();
