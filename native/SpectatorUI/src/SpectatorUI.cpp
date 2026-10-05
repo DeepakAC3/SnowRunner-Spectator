@@ -316,7 +316,7 @@ void QueueCommand(uint32_t command, uint64_t owner = 0, float value = 0, float v
     if (!g_running.load(std::memory_order_acquire) ||
         !g_connected.load(std::memory_order_acquire))
         return;
-    if (command == 2 || command == 3)
+    if (command == 2 || command == 3 || command == 9)
         ClearMouseGesture();
     std::lock_guard<std::mutex> lock(g_commandMutex);
     if (!g_running.load(std::memory_order_acquire) ||
@@ -647,8 +647,17 @@ void DrawMenu(State state)
     if (ImGui::Button("Spectate", ImVec2(110, 30)) && g_uiSelectedOwner != 0)
         QueueCommand(2, g_uiSelectedOwner);
     ImGui::SameLine();
-    if (ImGui::Button("Freecamera", ImVec2(110, 30)))
-        QueueCommand(3);
+    const bool freeCameraOn = (state.flags & kFreeCam) != 0;
+    if (freeCameraOn)
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.30f, 1.0f));
+    if (ImGui::Button(freeCameraOn ? "Freecamera: On" : "Freecamera: Off", ImVec2(140, 30)))
+        QueueCommand(9);
+    if (freeCameraOn)
+        ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(freeCameraOn
+            ? "Disable freecamera and stop following."
+            : "Enable freecamera.");
 
     bool face = g_uiFace;
     if (ImGui::Checkbox("Face truck", &face) && face != g_uiFace)

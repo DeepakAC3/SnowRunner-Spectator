@@ -25,7 +25,8 @@ closes it. Refresh lists validated trucks on the loaded map; select a truck and
 press Spectate. Face truck remains optional. While following with the menu
 closed, hold the right mouse button and drag, or use the controller right stick,
 to move around the truck. Releasing the control keeps the new offset. The menu
-also provides distance, height, smoothing, and Free camera controls. Closing the menu leaves
+also provides distance, height, and smoothing controls. Freecamera is an On/Off
+toggle; turning it off stops follow and returns to the game camera. Closing the menu leaves
 a compact follow status display. The list contains trucks, not player names;
 co-op player identity mapping is still an investigation item.
 
@@ -72,10 +73,14 @@ This branch adds a first reverse-engineering aid for the spectator project:
   closed. The normal freecam
   `I/K/J/L/O/U` movement keys remain available.
 
-When SnowRunner is the foreground window and freecam is active, the helper
-watches the `M`/`Esc` map boundary: it stops follow, disables freecam, and
-restores it after returning to the world. This is a short polling guard, so the
-game window must be focused before using those keys. The overlay is an external
+While SnowRunner is focused, the helper infers map transitions from observed
+`M`/`Esc` key presses and two separate Enter presses within three seconds while
+the map is inferred open (the select-and-confirm truck switch). Opening the map
+stops follow and disables active freecam;
+closing it restores freecam only if that opening disabled it. The menu toggle
+refuses to enable freecam while an observed map opening or restore is pending.
+This polling guard cannot confirm actual map visibility or detect other map
+controls, so focus the game before using those keys. The overlay is an external
 WinForms window positioned over the SnowRunner viewport.
 
 ## TODO

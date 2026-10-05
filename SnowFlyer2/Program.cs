@@ -91,8 +91,12 @@ namespace SnowFlyer2
         private static volatile bool IsFreeCamActive = false;
         private static volatile bool MapFreeCamRestorePending = false;
         private static int MapTransitionGeneration;
+        // Inferred from foreground M/Esc/double-Enter edges, not game UI visibility.
+        private static bool MapOpenFromObservedKeys;
         private static bool MapKeyWasDown;
         private static bool EscapeKeyWasDown;
+        private static bool EnterKeyWasDown;
+        private static long MapFirstEnterTimestamp;
         private static bool ShouldLoopTime = false;
         private static bool IsTimePassing = true;
         private static bool IsTrackingPlayerCoords = false;
@@ -274,6 +278,7 @@ namespace SnowFlyer2
         private const int VirtualKeyDown = 0x28;
         private const int VirtualKeyM = 0x4D;
         private const int VirtualKeyEscape = 0x1B;
+        private const int VirtualKeyEnter = 0x0D;
         // Legacy rig chain; never use it for rendered-camera diagnostics.
         private const long KnownCameraModuleOffset = 0x2A99E80;
         private const int KnownCameraVectorOffset = 0x1B8;
@@ -1213,22 +1218,66 @@ namespace SnowFlyer2
                     {
                         MapKeyWasDown = false;
                         EscapeKeyWasDown = false;
+                        EnterKeyWasDown = false;
+                        lock (CameraWriteGate) MapFirstEnterTimestamp = 0;
                         Thread.Sleep(10);
                         continue;
                     }
                     bool mapDown = GetAsyncKeyState(VirtualKeyM) < 0;
                     bool escapeDown = GetAsyncKeyState(VirtualKeyEscape) < 0;
+                    bool enterDown = GetAsyncKeyState(VirtualKeyEnter) < 0;
                     if (mapDown && !MapKeyWasDown)
                     {
-                        if (IsFreeCamActive)
-                            BeginMapFreeCamSafety(snowRunnerProcess);
-                        else if (MapFreeCamRestorePending)
-                            RequestMapFreeCamRestore(snowRunnerProcess);
+                        lock (CameraWriteGate)
+                        {
+                            MapOpenFromObservedKeys = !MapOpenFromObservedKeys;
+                            MapFirstEnterTimestamp = 0;
+                            if (MapOpenFromObservedKeys)
+                            {
+                                // Reopening before a delayed restore invalidates it.
+                                MapTransitionGeneration++;
+                                BeginMapFreeCamSafety(snowRunnerProcess);
+                            }
+                            else
+                                RequestMapFreeCamRestore(snowRunnerProcess);
+                        }
                     }
-                    if (escapeDown && !EscapeKeyWasDown && MapFreeCamRestorePending)
-                        RequestMapFreeCamRestore(snowRunnerProcess);
+                    if (escapeDown && !EscapeKeyWasDown)
+                    {
+                        lock (CameraWriteGate)
+                        {
+                            if (MapOpenFromObservedKeys)
+                            {
+                                MapOpenFromObservedKeys = false;
+                                MapFirstEnterTimestamp = 0;
+                                RequestMapFreeCamRestore(snowRunnerProcess);
+                            }
+                        }
+                    }
+                    if (enterDown && !EnterKeyWasDown)
+                    {
+                        lock (CameraWriteGate)
+                        {
+                            if (MapOpenFromObservedKeys)
+                            {
+                                // Selecting a map truck and confirming uses two
+                                // separate Enter presses. This is a key heuristic.
+                                long now = Stopwatch.GetTimestamp();
+                                if (MapFirstEnterTimestamp != 0 &&
+                                    now - MapFirstEnterTimestamp <= 3L * Stopwatch.Frequency)
+                                {
+                                    MapOpenFromObservedKeys = false;
+                                    MapFirstEnterTimestamp = 0;
+                                    RequestMapFreeCamRestore(snowRunnerProcess);
+                                }
+                                else
+                                    MapFirstEnterTimestamp = now;
+                            }
+                        }
+                    }
                     MapKeyWasDown = mapDown;
                     EscapeKeyWasDown = escapeDown;
+                    EnterKeyWasDown = enterDown;
                     Thread.Sleep(5);
                 }
             }
@@ -1290,20 +1339,17 @@ namespace SnowFlyer2
             Task.Run(() =>
             {
                 Thread.Sleep(500);
-                bool restore;
                 lock (CameraWriteGate)
                 {
-                    restore = MapFreeCamRestorePending &&
-                        generation == MapTransitionGeneration &&
-                        !IsFreeCamActive;
-                }
-                if (!restore)
-                    return;
-                Console.WriteLine("Map closed: restoring freecam after the world camera is ready.");
-                bool enabled = EnableFreeCam(snowRunnerProcess);
-                lock (CameraWriteGate)
-                {
-                    if (enabled && generation == MapTransitionGeneration)
+                    if (!MapFreeCamRestorePending ||
+                        MapOpenFromObservedKeys ||
+                        generation != MapTransitionGeneration ||
+                        IsFreeCamActive)
+                        return;
+                    // Keep the decision and transition atomic with the menu
+                    // toggle; both acquire CameraWriteGate before freecam patching.
+                    Console.WriteLine("Map closed: restoring freecam after the world camera is ready.");
+                    if (EnableFreeCam(snowRunnerProcess))
                         MapFreeCamRestorePending = false;
                 }
             });
@@ -1471,16 +1517,15 @@ namespace SnowFlyer2
                     out long actionVtableValue) ||
                 !TryReadPointer(processHandle, new IntPtr(actionValue + FollowTargetActionOwnerOffset),
                     out long reciprocalOwner) || reciprocalOwner != ownerValue ||
-                !TryReadPointer(processHandle, new IntPtr(rootValue + 0x28),
-                    out long firstValue) || !IsValidCameraPointer(firstValue) ||
-                !TryReadPointer(processHandle, new IntPtr(firstValue + 0x18),
-                    out long bodyValue) || !IsValidCameraPointer(bodyValue) ||
                 !TryReadPointer(processHandle, new IntPtr(ownerValue + FollowTargetOwnerBodyOffset),
-                    out long ownerBodyValue) || bodyValue != ownerBodyValue ||
+                    out long bodyValue) || !IsValidCameraPointer(bodyValue) ||
                 !TryReadPointer(processHandle, new IntPtr(bodyValue),
                     out long chassisVtableValue))
                 return false;
 
+            // DRIVE_LOGIC's first physics body is not necessarily the chassis.
+            // Bootstrap its vtable from the explicit owner chassis link; each
+            // scan candidate still passes the complete truck identity validator.
             activeOwner = new IntPtr(ownerValue);
             actionVtable = new IntPtr(actionVtableValue);
             chassisVtable = new IntPtr(chassisVtableValue);

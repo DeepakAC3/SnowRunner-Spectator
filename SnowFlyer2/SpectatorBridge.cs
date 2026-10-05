@@ -63,7 +63,7 @@ namespace SnowFlyer2
                                 float value2 = reader.ReadSingle();
                                 uint requestFlags = reader.ReadUInt32();
                                 reader.ReadUInt32();
-                                if (magic != SpectatorProtocolMagic || command > 8)
+                                if (magic != SpectatorProtocolMagic || command > 9)
                                     break;
                                 lock (CameraWriteGate)
                                 {
@@ -145,6 +145,38 @@ namespace SnowFlyer2
                 case 8:
                     QueueCameraOrbitMouse(game, value, value2);
                     return;
+                case 9:
+                    string freeCameraResult = ToggleFreeCameraFromMenu(game);
+                    lock (SpectatorBridgeGate) SpectatorBridgeMessage = freeCameraResult;
+                    return;
+            }
+        }
+
+        private static string ToggleFreeCameraFromMenu(Process game)
+        {
+            // Serialize the decision with follow writes and freecam patching. The
+            // map watcher temporarily disables freecam and restores it on exit;
+            // enabling it while that transition is pending would black out the map.
+            lock (CameraWriteGate)
+            lock (FreeCamTransitionGate)
+            {
+                if (MapOpenFromObservedKeys || MapFreeCamRestorePending)
+                    return "Close the map before toggling freecamera.";
+
+                if (IsFreeCamActive)
+                {
+                    bool wasFollowing = IsFollowingPlayer;
+                    StopCameraFollowLocked(CameraFollowGeneration);
+                    if (wasFollowing)
+                        RecordCameraFollowStoppedLocked("Freecamera disabled from menu.");
+                    return DisableFreeCam(game)
+                        ? "Freecamera off: game camera restored."
+                        : "Freecamera could not be disabled; follow has stopped.";
+                }
+
+                return EnableFreeCam(game)
+                    ? "Freecamera on."
+                    : "Freecamera could not be enabled.";
             }
         }
 
