@@ -1595,7 +1595,7 @@ namespace SnowFlyer2
                 !TryReadPointer(processHandle,
                     new IntPtr(modelValue + FollowTargetModelResourceOffset),
                     out long resourceValue) || !IsValidCameraPointer(resourceValue) ||
-                !TryReadAsciiPointer(processHandle,
+                !TryReadResourceAssetString(processHandle,
                     new IntPtr(resourceValue + FollowTargetResourceAssetOffset),
                     out string assetId) ||
                 !assetId.StartsWith("trucks_", StringComparison.Ordinal) ||
@@ -1698,6 +1698,54 @@ namespace SnowFlyer2
             Vector3 stored = new Vector3(values[12], values[13], values[14]);
             position = StoredZyxToWorld(stored);
             return IsFiniteVector(position);
+        }
+
+        private static bool TryReadResourceAssetString(IntPtr processHandle,
+            IntPtr address, out string text)
+        {
+            text = null;
+            // Observed resource layout: a 16-byte inline/pointer union followed
+            // by count and capacity. Some counts include the trailing NUL, so
+            // this is deliberately not assumed to be a standard string object.
+            if (!TryReadBytes(processHandle, address, out byte[] header, 32))
+                return false;
+            ulong count = BitConverter.ToUInt64(header, 16);
+            ulong capacity = BitConverter.ToUInt64(header, 24);
+            if (count == 0 || count > FollowTargetMaxAssetLength)
+                return false;
+
+            byte[] bytes;
+            int readLength;
+            if (capacity == 15)
+            {
+                if (count > 16)
+                    return false;
+                readLength = Math.Min((int)count + 1, 16);
+                bytes = new byte[readLength];
+                Array.Copy(header, bytes, readLength);
+            }
+            else
+            {
+                if (capacity < 16 || capacity < count - 1)
+                    return false;
+                long pointer = BitConverter.ToInt64(header, 0);
+                if (!IsValidCameraPointer(pointer))
+                    return false;
+                readLength = Math.Min((int)count + (count <= capacity ? 1 : 0),
+                    FollowTargetMaxAssetLength);
+                if (!TryReadBytes(processHandle, new IntPtr(pointer), out bytes, readLength))
+                    return false;
+            }
+
+            int length = Array.IndexOf(bytes, (byte)0);
+            if (length <= 0 || (length != (int)count && length != (int)count - 1) ||
+                (ulong)length > capacity)
+                return false;
+            for (int index = 0; index < length; index++)
+                if (bytes[index] < 0x20 || bytes[index] > 0x7E)
+                    return false;
+            text = Encoding.ASCII.GetString(bytes, 0, length);
+            return true;
         }
 
         private static bool TryReadAsciiPointer(IntPtr processHandle, IntPtr address,

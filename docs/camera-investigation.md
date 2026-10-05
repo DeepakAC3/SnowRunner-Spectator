@@ -62,3 +62,14 @@ The actual Freecamera button was clicked on at 03:30:45.9978 UTC; patch success 
 Opening the map with M while freecam was on disabled it at 03:35:15.3474 UTC. Switching to Scout 800 through map navigation returned to a visible Scout, and freecam restored at 03:35:56.0245 UTC. This guard still infers transitions from keys rather than detecting actual map visibility.
 
 The scan and transition events are recorded in `bin/Spectator/logs/spectator-20261005-085312.log`. Release helper and native builds passed with existing warnings. Co-op was not tested in this round.
+
+### Resource asset names stored inline
+
+A read-only inspection while occupying GMC 9500 found a valid chassis owner
+whose resource name at `resource+0x10` was inline `trucks_gmc_9500` rather than
+a pointer. The following fields were count 15 and capacity 15, with the count
+including the trailing NUL. CK1500 used a heap pointer, count 23, and capacity
+31 for `trucks_chevrolet_ck1500`. The asset reader now handles this observed
+16-byte inline/pointer union and validates bounded count, capacity, terminator,
+and printable ASCII for both representations. The bone-name reader and truck
+structure checks are unchanged. Runtime verification of this reader is pending.
