@@ -42,3 +42,23 @@ User preference: commit locally and push every tenth new commit. Last remote che
 - A controlled runtime validation then drove the truck with freecam off, re-enabled freecam, started follow, and held forward. The anchor moved from approximately `(904.25, 115.65, 570.29)` to `(903.96, 115.65, 571.14)` while the camera target moved from `(902.26, 118.54, 558.63)` to `(901.97, 118.54, 559.48)`, preserving the approximately `(-1.99, 2.88, -11.66)` offset.
 - The follow loop now reads the target’s 16-byte-strided basis vectors at `+0x170`, `+0x180`, and `+0x190`, converts the initial world offset into target-local coordinates, and rotates that offset with the target. A controlled `W+D` runtime pass changed the reported world offset from `(13.86, 4.90, 3.90)` to approximately `(-1.67, 2.86, 9.33)` as the truck turned while the camera target continued tracking it.
 - A live overlay test selected a non-active candidate at approximately `(-583.14, 69.46, -115.79)` and started follow with a distinct offset, proving selection does not require entering the current truck. A separate live `M` test reproduced the black-map failure with freecam active; the rebuilt watcher then observed `M`, stopped follow, and changed the freecam flag from `1` to `0` before map navigation.
+
+## 2026-10-05: truck class scanning and freecamera toggle
+
+Fix `42a1764` was deployed from `bin/Spectator` with game PID 24392 and helper PID 7316. Scanning now obtains the chassis body from `owner+0x5D0`; the first physics body reached through `DRIVE_LOGIC+0x28` can differ from the chassis. Candidate truck validation remains intact. The Freecamera button toggles freecam, and delayed map restoration checks and enables freecam under the same camera lock as the toggle.
+
+Each Refresh returned nine validated trucks while occupying the following vehicles. Occupancy and vehicle names were independently observed on the external monitor through the game map and menu; the log records scan counts but does not itself establish the vehicle class. The first list entry matched the occupied truck.
+
+| Occupied truck | Class | Refresh observation (UTC) |
+| --- | --- | --- |
+| Fleetstar | Heavy Duty | 03:28:09.7932542 |
+| Transtar | Highway | 03:30:18.1214143 |
+| Bandit | Offroad | 03:34:08.8141526 |
+| Scout 800 | Scout | 03:36:35.0126596 |
+| Azov 670963N Atom | Heavy | 03:39:40.7790039 |
+
+The actual Freecamera button was clicked on at 03:30:45.9978 UTC; patch success and the On label were observed. While occupying Transtar, Spectate attached to Fleetstar: the camera was approximately `(-707.68, 28.27, 799.28)` and the target truck `(-713.62, 23.02, 809.18)`. Clicking Freecamera off at 03:32:25.9119 UTC stopped follow and restored the game camera. No Ctrl+F1 shortcut was used.
+
+Opening the map with M while freecam was on disabled it at 03:35:15.3474 UTC. Switching to Scout 800 through map navigation returned to a visible Scout, and freecam restored at 03:35:56.0245 UTC. This guard still infers transitions from keys rather than detecting actual map visibility.
+
+The scan and transition events are recorded in `bin/Spectator/logs/spectator-20261005-085312.log`. Release helper and native builds passed with existing warnings. Co-op was not tested in this round.
